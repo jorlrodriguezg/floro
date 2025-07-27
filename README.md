@@ -1,7 +1,5 @@
 ---
 title: "FLORO: Foundation Learning Of Remote Sensing Observations for Ecological Research"
-permalink: /floro/
-author_profile: true
 ---
 <p style="text-align: center;">
 Jorge L. Rodríguez, Kasper Johansen, Areej Alwahas, Mariana Elías-Lara, Victor Angulo-Morales, Fernando T. Maestre and Matthew F. McCabe
