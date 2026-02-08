@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from src.models.util.blocks import FeatureFusionBlock, _make_scratch
-from src.models.Model_Components import SelfAttentionBlockViT, trunc_normal_
+from floro.models.util.blocks import FeatureFusionBlock, _make_scratch
+from floro.models.Model_Components import SelfAttentionBlockViT, trunc_normal_
 
 # Helper function to build 2D sine-cosine positional embeddings
 def build_2d_sincos_posemb(h, w, embed_dim=1024, temperature=10000.):
@@ -325,68 +325,6 @@ class FLORODPTDecoder(nn.Module):
         return out, dpt_out
 
 
-    
-    # @torch.no_grad()
-    # def infer_geotiff(self, image_path, modality_path, input_size=256):
-    #     image, transform, crs, orig_shape = self.image2tensor(image_path, input_size)
-    #     ms_tensor, elevation_tensor, (orig_h, orig_w), transform, crs = self.load_dual_inputs(image_path, modality_path)
-
-    #     # Model prediction
-    #     pred = self.forward(ms_tensor, elevation_tensor, )  # [1, H', W'] ### missing implementation
-    #     pred = F.interpolate(pred[:, None], size=orig_shape, mode='bilinear', align_corners=True)[0, 0]
-
-    #     return pred.cpu().numpy(), transform, crs
-    
-    # def load_dual_inputs(self, image_path_ms, image_path_elevation, input_size=256):
-    #     def load_image(path):
-    #         with rasterio.open(path) as src:
-    #             img = src.read()  # [C, H, W]
-    #             transform = src.transform
-    #             crs = src.crs
-    #         return img, transform, crs
-
-    #     ms_img, transform, crs = load_image(image_path_ms)
-    #     elevation_img, _, _ = load_image(image_path_elevation)
-
-    #     # Normalize
-    #     ms_img = ms_img / 255.0 if ms_img.dtype == torch.uint8 else ms_img.astype(np.float32) * 0.0001 # assuming image in reflectance scaled to 10.000
-    #     elevation_img = elevation_img.astype(np.float32) * 0.0001  # Assuming elevation is in meters scaled 10.000
-
-    #     # Convert to tensors
-    #     ms_tensor = torch.from_numpy(ms_img).float()  # [C, H, W]
-    #     elevation_tensor = torch.from_numpy(elevation_img).float()
-
-    #     # Resize both
-    #     orig_h, orig_w = ms_tensor.shape[1:]
-    #     aspect = orig_h / orig_w
-    #     if aspect >= 1.0:
-    #         target_h = input_size
-    #         target_w = int(input_size / aspect)
-    #     else:
-    #         target_w = input_size
-    #         target_h = int(input_size * aspect)
-
-    #     ms_tensor = F.interpolate(ms_tensor.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=True)[0]
-    #     elevation_tensor = F.interpolate(elevation_tensor.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=True)[0]
-
-    #     ms_tensor = ms_tensor.unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
-    #     elevation_tensor = elevation_tensor.unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
-
-    #     return ms_tensor, elevation_tensor, (orig_h, orig_w), transform, crs
-
-
-    # def save_geotiff(array, transform, crs, path, dtype='float32'):
-    #     with rasterio.open(
-    #         path, 'w',
-    #         driver='GTiff',
-    #         height=array.shape[0],
-    #         width=array.shape[1],
-    #         count=1,
-    #         dtype=dtype,
-    #         crs=crs,
-    #         transform=transform
-    #     ) as dst:
-    #         dst.write(array.astype(dtype), 1)
 
 
 

@@ -1,31 +1,25 @@
 # Import necessary modules
 import torch
-from src.data.dataloader_vegetation_uav import LoadersPreparation as LoadersPreparationSeg
-from src.data.dataloader_vegetation_uav_chm import LoadersPreparation as LoadersPreparationReg
-from src.data.dataloader_france_dem import LoadersPreparation as LoadersPreparationFranceDEM
-from src.data.dataloading_benchmark_datasets import LoadersPreparationBench
+from floro.data.dataloader_vegetation_uav import LoadersPreparation as LoadersPreparationSeg
+from floro.data.dataloader_vegetation_uav_chm import LoadersPreparation as LoadersPreparationReg
+from floro.data.dataloader_vegetation_uav_chm_bm import LoadersPreparation as LoadersPreparationCHMBM
+from floro.data.dataloader_france_dem import LoadersPreparation as LoadersPreparationFranceDEM
+from floro.data.dataloading_benchmark_datasets import LoadersPreparationBench
 # Add imports for your other dataloaders here
 
-def get_dataloaders_seg(batch_size, path_to_data, test_size=0.2, workers=4, device='cuda',  task=None, distributed=None, **kwargs):
+def get_dataloaders_seg(path_to_data, test_size=0.2, mean = None, std = None, **kwargs):
     
     #mean = torch.tensor([0.1690, 0.2079, 0.2433, 0.3591, 0.0900])
     #std = torch.tensor([0.0657, 0.0774, 0.1140, 0.1205, 0.0984])
-    mean = None
-    std = None
-    
     train_dataloader, val_dataloader = LoadersPreparationSeg(
         path_to_data,
-        batch_size=batch_size,
         test_size=test_size,
-        workers=workers,
-        device=device,
         mean = mean,
         std = std,
         rotate_type = 'fixed90',
         downsample_scale=None,
-        blur_sigma=1.0,
-        noise_max = 0.1,
-        distributed = distributed,
+        blur_sigma=1.2,
+        noise_max = 0.2,
         type="training"
         )
     
@@ -50,13 +44,33 @@ def get_dataloaders_reg(batch_size, path_to_data, test_size=0.2, workers=4, devi
         downsample_scale=None,
         blur_sigma=1.0,
         noise_max = 0.1,
-        distributed = distributed,
         type="training"
         )
     
     return train_dataloader, val_dataloader
 
-def get_dataloaders_reg_dem(batch_size, path_to_data, test_size=0.2, workers=4, device='cuda',  task=None, distributed=None, **kwargs):
+def get_dataloaders_reg_chm_bm(path_to_data, test_size=0.2, **kwargs):
+    
+    #mean = torch.tensor([0.1690, 0.2079, 0.2433, 0.3591, 0.0900])
+    #std = torch.tensor([0.0657, 0.0774, 0.1140, 0.1205, 0.0984])
+    mean = None
+    std = None
+    
+    train_dataloader, val_dataloader = LoadersPreparationCHMBM(
+        path_to_data,
+        test_size=test_size,
+        mean = mean,
+        std = std,
+        rotate_type = 'fixed90',
+        downsample_scale=None,
+        blur_sigma=1.0,
+        noise_max = 0.1,
+        type="training"
+        )
+    
+    return train_dataloader, val_dataloader
+
+def get_dataloaders_reg_dem(path_to_data, test_size=0.2, **kwargs):
     
     #mean = torch.tensor([0.1690, 0.2079, 0.2433, 0.3591, 0.0900])
     #std = torch.tensor([0.0657, 0.0774, 0.1140, 0.1205, 0.0984])
@@ -65,17 +79,13 @@ def get_dataloaders_reg_dem(batch_size, path_to_data, test_size=0.2, workers=4, 
     
     train_dataloader, val_dataloader = LoadersPreparationFranceDEM(
         path_to_data,
-        batch_size=batch_size,
         test_size=test_size,
-        workers=workers,
-        device=device,
         mean = mean,
         std = std,
         rotate_type = 'fixed90',
         downsample_scale=None,
         blur_sigma=1.0,
         noise_max = 0.1,
-        distributed = distributed,
         type="training"
         )
     
@@ -106,19 +116,17 @@ def get_dataloaders_reg_dem(batch_size, path_to_data, test_size=0.2, workers=4, 
     
 #     return train_dataloader, val_dataloader
 
-def get_dataloaders_potsdam(batch_size, path_to_data, test_size=0.2, workers=4, device='cuda',  task=None, distributed=None, **kwargs):
+def get_dataloaders_potsdam(path_to_data, test_size=0.2, workers=4, device='cuda',  **kwargs):
     
     #mean = torch.tensor([0.1690, 0.2079, 0.2433, 0.3591, 0.0900])
     #std = torch.tensor([0.0657, 0.0774, 0.1140, 0.1205, 0.0984])
     mean = None
     std = None
     
-    train_dataloader, val_dataloader = LoadersPreparationBench(
+    train_data, val_data = LoadersPreparationBench(
         path_to_data,
         dataset_type='custom',
         test_size=test_size,
-        batch_size=batch_size,
-        workers=workers,
         device=device,
         mean = None,
         std = None,
@@ -126,11 +134,10 @@ def get_dataloaders_potsdam(batch_size, path_to_data, test_size=0.2, workers=4, 
         downsample_scale=None,
         blur_sigma=1.5,
         noise_max = 0.2,
-        distributed = distributed,
         type="training"
         )
     
-    return train_dataloader, val_dataloader
+    return train_data, val_data
 
 def get_dataloaders_loveDA(batch_size, path_to_data, test_size=0.2, workers=4, device='cuda',  task=None, distributed=None, **kwargs):
     

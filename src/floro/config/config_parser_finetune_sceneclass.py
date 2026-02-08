@@ -15,7 +15,8 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 
     # Dataloaidng
-    parser.add_argument('--workers', default=4, type=int, help='Number of workers for dataloading')
+    parser.add_argument('--workers', default=2, type=int, help='Number of workers for dataloading')
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     # Basic Training Parameters
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs to train')

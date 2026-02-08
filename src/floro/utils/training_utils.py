@@ -5,11 +5,13 @@ from matplotlib.colors import LightSource
 from typing import Union, Dict, Optional
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.nn import Module
 from torch.optim import Optimizer
+import torch.distributed as dist
 import wandb
 from contextlib import nullcontext
+from floro.utils.dist_utils import is_dist_avail_and_initialized, is_main_process, get_rank
 
 # Helper function to resize and apply mask
 def apply_mask_loss(image, mask, patch_size=16):
@@ -30,6 +32,39 @@ def compute_loss_with_fallback(prediction, target, mask, criterion):
         return criterion(prediction, target)
     else:
         return criterion(prediction[mask], target[mask])
+    
+def tensor_stats(t: torch.Tensor, name: str):
+    """Print safe stats without relying on torch.nanmin/nanmean.
+    Works across PyTorch versions and dtypes, handles empty/invalid tensors.
+    """
+    with torch.no_grad():
+        # Ensure floating for stats, but don't modify the original
+        x = t.detach()
+        if not x.is_floating_point():
+            x = x.float()
+
+        numel = x.numel()
+        if numel == 0:
+            print(f"[debug] {name}: empty tensor")
+            return
+
+        finite = torch.isfinite(x)
+        n_valid = int(finite.sum().item())
+        rank = int(os.environ.get("RANK", "0"))
+
+        if n_valid == 0:
+            print(f"[debug][r{rank}] {name}: shape={tuple(x.shape)} valid=0/{numel} (all NaN/Inf)")
+            return
+
+        x_valid = x[finite]
+        mn  = x_valid.min().item()
+        mx  = x_valid.max().item()
+        mean = x_valid.mean().item()
+
+        print(
+            f"[debug][r{rank}] {name}: shape={tuple(x.shape)} "
+            f"valid={n_valid}/{numel} min={mn:.6g} max={mx:.6g} mean={mean:.6g}"
+        )
 
 def train_one_epoch(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion1, criterion2, device, scaler, args):
     model_enc.train()  # Set the encoder to training mode
@@ -1171,199 +1206,11 @@ def validate_one_epoch_finetuning_dualpath(model_enc, model_dec, dataloader, cri
 
 
 
-def finetune_one_epoch_geo_reg(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion, device, args):
-    if args.train_mode == "decoder_only":
-        print("Freezing encoder parameters and setting encoder to evaluation mode.")
-        for param in model_enc.parameters():
-            param.requires_grad = False
-        model_enc.eval()  # Set encoder to evaluation mode.
-        optimizer_dec.zero_grad()
-        optimizer_enc = None
-    else:
-        model_enc.train()
-        optimizer_enc.zero_grad()
-        optimizer_dec.zero_grad()
 
-    model_dec.train()  # Set the decoder to training mode
 
-    running_loss = 0.0
-        
-    for i, batch in enumerate(dataloader):
-        image_ms = batch['image'].to(device)
-        elevation = batch['elevation'].to(device)
-        
-        target = batch['target'].to(device)
-        # Check and handle NaN or Inf explicitly
-        nan_inf_mask = torch.isnan(target) | torch.isinf(target)    
-        if nan_inf_mask.any():
-            #print(f"Detected NaN or inf in targets at batch index {i}. Handling...")
-            target = torch.nan_to_num(target, nan=0.0, posinf=0, neginf=0)
-        
-        #target_labels = batch['clusters'].to(device).long()
-        gt = batch['geo_transform'].to(device)
-        # We want the model to see as much of the image context as possible
-        mask_ratio_ms = args.masking_ms
-        mask_ratio_mod = args.masking_modality
 
-        # Encode and decode the representations
-        outputs_enc = model_enc(image_ms, elevation, gt, mask_ratio_ms=mask_ratio_ms, mask_ratio_elev=mask_ratio_mod, return_intermediate=True)
-        prediction = model_dec(outputs_enc, gt)
-        
-        loss = criterion(prediction.float(), target.float())
-            
-        # Backward pass
-        if not torch.isnan(loss) and not torch.isinf(loss):
-            if args.train_mode == "decoder_only":
-                loss.backward()
-                optimizer_dec.step()
-                optimizer_dec.zero_grad()
-            else:        
-                loss.backward()
-                optimizer_enc.step()
-                optimizer_dec.step()
-                
-                optimizer_enc.zero_grad()
-                optimizer_dec.zero_grad()
-        
-            running_loss += loss.item() * image_ms.size(0)   
-        
 
-    epoch_loss = running_loss / len(dataloader.dataset)
 
-    print(f'Training Loss: {epoch_loss:.4f}')
-
-    return epoch_loss
-
-def validate_one_epoch_finetuning_geo_reg(model_enc, model_dec, dataloader, criterion, device, args, log_preds_wb = False):
-    """
-    Validate the model for one epoch.
-    
-    This function sets the encoder and decoder to evaluation mode, and it uses
-    torch.no_grad() (with optional autocast) to perform inference. It computes the 
-    loss over the validation dataset without updating any model parameters.
-    
-    Parameters:
-      model_enc: The encoder model.
-      model_dec: The decoder model.
-      dataloader: DataLoader for the validation dataset.
-      criterion: Loss function (e.g., nn.CrossEntropyLoss).
-      device: The device (CPU or GPU) for computations.
-      args: Additional arguments (e.g., task type, fine-tune mode).
-      
-    Returns:
-      epoch_loss: The average loss for the validation epoch.
-    """
-        
-    running_loss = 0.0
-
-    # Disable gradient computation for validation.
-    with torch.no_grad():
-        # Optionally use autocast for mixed precision inference.
-        
-        for batch_idx, batch in enumerate(dataloader):
-            # Get the input data and send to device.
-            image_ms = batch['image'].to(device)
-            elevation = batch['elevation'].to(device)
-            
-            
-            target = batch['target'].to(device)
-            # Check and handle NaN or Inf explicitly
-            nan_inf_mask = torch.isnan(target) | torch.isinf(target)    
-            if nan_inf_mask.any():
-                #print(f"Detected NaN or inf in targets at batch index {i}. Handling...")
-                target = torch.nan_to_num(target, nan=0.0, posinf=0, neginf=0)
-            
-            gt = batch['geo_transform'].to(device)
-            
-            # During validation, we usually let the model see the full input.
-            mask_ratio_ms = args.masking_ms
-            mask_ratio_mod = args.masking_modality
-            
-            # Forward pass through encoder and decoder.
-            outputs_enc = model_enc(image_ms, elevation, gt, mask_ratio_ms=mask_ratio_ms, mask_ratio_elev=mask_ratio_mod, return_intermediate=True)
-            prediction = model_dec(outputs_enc, gt)
-            
-            loss = criterion(prediction, target)
-            if not torch.isnan(loss) and not torch.isinf(loss):
-                running_loss += loss.item() * image_ms.size(0)
-            # Log image to W&B
-            if log_preds_wb == True:
-                log_image_reg_wandb(image_ms, elevation, prediction, target)
-                
-    
-    # Compute the epoch's average loss.
-    epoch_loss = running_loss / len(dataloader.dataset)
-    print(f'Validation Loss: {epoch_loss:.4f}')
-    
-    return epoch_loss
-
-def finetune_one_epoch_geo_sc(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion, device, scaler, args):
-    if args.train_mode == "decoder_only":
-        print("Freezing encoder parameters and setting encoder to evaluation mode.")
-        for param in model_enc.parameters():
-            param.requires_grad = False
-        model_enc.eval()  # Set encoder to evaluation mode.
-        optimizer_dec.zero_grad()
-        optimizer_enc = None
-    else:
-        model_enc.train()
-        optimizer_enc.zero_grad()
-        optimizer_dec.zero_grad()
-
-    model_dec.train()  # Set the decoder to training mode
-
-    running_loss = 0.0
-    accumulation_steps = args.accumulation_steps  # Number of steps to accumulate gradients
-    
-    for i, batch in enumerate(dataloader):
-        image_ms = batch['image'].to(device)
-        elevation = batch['elevation'].to(device)
-        if args.task == 'segmentation':  
-            target = batch['target'].squeeze(1).to(device).long()
-        else:
-            target = batch['target'].to(device)
-        
-        #target_labels = batch['clusters'].to(device).long()
-        gt = batch['geo_transform'].to(device)
-        # We want the model to see as much of the image context as possible
-        mask_ratio_ms = args.masking_ms
-        mask_ratio_mod = args.masking_modality
-        
-        with autocast():
-            # Encode and decode the representations
-            outputs_enc = model_enc(image_ms, elevation, gt, mask_ratio_ms=mask_ratio_ms, mask_ratio_elev=mask_ratio_mod)
-            prediction = model_dec(outputs_enc, gt)
-            loss = criterion(prediction, target)
-            
-        # Backward pass
-        if not torch.isnan(loss):
-            scaler.scale(loss).backward() # This will compute gradients for both dec and enc parts of the model
-            if args.train_mode == "decoder_only":
-        
-                # Update weights
-                if (i + 1) % accumulation_steps == 0:
-                    scaler.step(optimizer_dec)
-                    scaler.update()
-
-                    optimizer_dec.zero_grad()
-            else:        
-                # Update weights
-                if (i + 1) % accumulation_steps == 0:
-                    scaler.step(optimizer_enc)
-                    scaler.step(optimizer_dec)
-                    scaler.update()
-
-                    optimizer_enc.zero_grad()
-                    optimizer_dec.zero_grad()
-            
-            running_loss += loss.item() * image_ms.size(0) 
-        
-
-    epoch_loss = running_loss / len(dataloader.dataset)
-
-    print(f'Training Loss: {epoch_loss:.4f}')
-
-    return epoch_loss
 
 def validate_one_epoch_finetuning_geo_sc(model_enc, model_dec, dataloader, criterion, device, args, log_preds_wb = False):
     """
@@ -1487,8 +1334,7 @@ def save_checkpoint(
         save_path = os.path.join(save_dir, file_name)
     else:
         # If checkpoint_path is specified, just use it directly
-        #save_path = checkpoint_path
-        save_path = checkpoint_path.replace(".pth.jar",f"_FT_{epoch}.pth.jar")
+        save_path = checkpoint_path.replace(".pth.jar", f"_FT_{epoch}.pth.jar")
         # Ensure its parent directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -1502,9 +1348,17 @@ def save_checkpoint(
     # 3. Handle single vs multiple models
     if isinstance(models, dict):
         for model_name, model_obj in models.items():
-            checkpoint[f"{model_name}_state_dict"] = model_obj.state_dict()
+            # Check if the model is wrapped with DDP and access module.state_dict
+            if isinstance(model_obj, torch.nn.parallel.DistributedDataParallel):
+                checkpoint[f"{model_name}_state_dict"] = model_obj.module.state_dict()
+            else:
+                checkpoint[f"{model_name}_state_dict"] = model_obj.state_dict()
     else:
-        checkpoint["model_state_dict"] = models.state_dict()
+        # Check if the single model is wrapped with DDP and access module.state_dict
+        if isinstance(models, torch.nn.parallel.DistributedDataParallel):
+            checkpoint["model_state_dict"] = models.module.state_dict()
+        else:
+            checkpoint["model_state_dict"] = models.state_dict()
 
     # 4. Handle single vs multiple optimizers
     if isinstance(optimizers, dict):
@@ -1513,8 +1367,101 @@ def save_checkpoint(
     else:
         checkpoint["optimizer_state_dict"] = optimizers.state_dict()
 
-    # 5. Save the checkpoint
-    torch.save(checkpoint, save_path)
-    #print(f"Checkpoint saved to: {save_path}")
+    # 5. Save the checkpoint only on rank 0
+    if torch.distributed.get_rank() == 0:
+        torch.save(checkpoint, save_path)
+        print(f"Checkpoint saved to: {save_path}")
+    
     return save_path
+
+
+# def save_checkpoint(
+#     models: Union[Module, Dict[str, Module]],
+#     optimizers: Union[Optimizer, Dict[str, Optimizer]],
+#     epoch: int,
+#     loss: float,
+#     save_dir: str,
+#     prefix: str = "model",
+#     dt: str = "",
+#     checkpoint_path: Optional[str] = None,
+#     create_subdir: bool = False
+# ) -> str:
+#     """
+#     Saves a checkpoint for one or multiple models and optimizers.
+
+#     Args:
+#         models (Module or Dict[str, Module]):
+#             Either a single PyTorch model (nn.Module) or a dictionary mapping
+#             a string key to multiple models (e.g., {'encoder': enc_model, 'decoder': dec_model}).
+#         optimizers (Optimizer or Dict[str, Optimizer]):
+#             Either a single PyTorch optimizer or a dictionary mapping
+#             a string key to multiple optimizers.
+#         epoch (int):
+#             The current training epoch.
+#         loss (float):
+#             The training (or validation) loss at this epoch.
+#         save_dir (str):
+#             The directory where you want to save the checkpoint (used only if `checkpoint_path` is not specified).
+#         prefix (str, optional):
+#             A prefix for the filename (default: "model").
+#         dt (str, optional):
+#             A date/time string or unique identifier for the checkpoint file (default: "").
+#         checkpoint_path (str, optional):
+#             If provided, saves the checkpoint to this path (overwriting if it exists).
+#             If None, a filename is constructed using `save_dir`, `prefix`, `dt`, and `epoch`.
+#             Default: None
+#         create_subdir (bool, optional):
+#             If True, a new subdirectory named with the prefix or dt can be created
+#             to organize checkpoints. Defaults to False.
+
+#     Returns:
+#         str: The final file path of the saved checkpoint.
+#     """
+
+#     # 1. If a direct path is provided, we save there. Otherwise, build the path.
+#     if checkpoint_path is None:
+#         if create_subdir and dt:
+#             save_dir = os.path.join(save_dir, f"{prefix}_{dt}")
+
+#         # Ensure directory exists
+#         os.makedirs(save_dir, exist_ok=True)
+        
+#         # Construct filename
+#         file_name = f"{prefix}"
+#         if dt:
+#             file_name += f"_{dt}"
+#         file_name += f"_epoch{epoch}.pth"
+#         save_path = os.path.join(save_dir, file_name)
+#     else:
+#         # If checkpoint_path is specified, just use it directly
+#         #save_path = checkpoint_path
+#         save_path = checkpoint_path.replace(".pth.jar",f"_FT_{epoch}.pth.jar")
+#         # Ensure its parent directory exists
+#         os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+#     # 2. Create the checkpoint dictionary
+#     checkpoint = {
+#         "epoch": epoch,
+#         "loss": loss,
+#         "datetime": dt  # for reference if needed
+#     }
+
+#     # 3. Handle single vs multiple models
+#     if isinstance(models, dict):
+#         for model_name, model_obj in models.items():
+#             checkpoint[f"{model_name}_state_dict"] = model_obj.state_dict()
+#     else:
+#         checkpoint["model_state_dict"] = models.state_dict()
+
+#     # 4. Handle single vs multiple optimizers
+#     if isinstance(optimizers, dict):
+#         for opt_name, opt_obj in optimizers.items():
+#             checkpoint[f"{opt_name}_state_dict"] = opt_obj.state_dict()
+#     else:
+#         checkpoint["optimizer_state_dict"] = optimizers.state_dict()
+
+#     # 5. Save the checkpoint
+#     torch.save(checkpoint, save_path)
+#     #print(f"Checkpoint saved to: {save_path}")
+#     return save_path
 

@@ -276,8 +276,6 @@ def LoadersPreparationBench(
     root_dir,
     dataset_type='custom',
     test_size=0.1,
-    batch_size=1,
-    workers=1,
     device='cpu',
     mean=None,
     std=None,
@@ -285,9 +283,8 @@ def LoadersPreparationBench(
     downsample_scale=0.25,
     blur_sigma=1.0,
     noise_max=0.2,
-    distributed=None,
     type=None,
-    droplast=True
+    
 ):
     if dataset_type == 'loveda':
         # Use predefined 'Train' and 'Val' splits
@@ -357,13 +354,6 @@ def LoadersPreparationBench(
             ToTensor()
         ])
 
-    if distributed == 'distributed':
-        return train_dataset, val_dataset
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                  drop_last=droplast, num_workers=workers)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                                drop_last=droplast, num_workers=workers)
-        print(f"{dataset_type.upper()} dataset: Train -> [{len(train_loader)}]  Test -> [{len(val_loader)}]")
-        return train_loader, val_loader
+    return train_dataset, val_dataset
+    
 

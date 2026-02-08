@@ -4,7 +4,7 @@ import torch.nn as nn
 from typing import Optional
 import math
 
-from src.models.Model_Components import SelfAttentionBlockViT, PatchEmbed, build_2d_sincos_posemb, trunc_normal_
+from floro.models.Model_Components import SelfAttentionBlockViT, PatchEmbed, build_2d_sincos_posemb, trunc_normal_
 
 class MultiMAE_Encoder(nn.Module):
     def __init__(
@@ -84,7 +84,7 @@ class MultiMAE_Encoder(nn.Module):
         # Grid indices
         i_coords = torch.arange(h_posemb, device=device, dtype=torch.float32)
         j_coords = torch.arange(w_posemb, device=device, dtype=torch.float32)
-        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")  # [H, W]
+        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")  # [H, W] # i=row (y), j=col (x)
 
         # Absolute coordinates (EPSG:3857 meters)
         origin_x = geotransform[:, 0]  # Easting
@@ -92,8 +92,8 @@ class MultiMAE_Encoder(nn.Module):
         pixel_width = geotransform[:, 1]
         pixel_height = geotransform[:, 5]
 
-        center_x_abs = origin_x.view(-1, 1, 1) + (i_grid * self.patch_size + self.patch_size / 2) * pixel_width.view(-1, 1, 1)
-        center_y_abs = origin_y.view(-1, 1, 1) + (j_grid * self.patch_size + self.patch_size / 2) * pixel_height.view(-1, 1, 1)
+        center_x_abs = origin_x.view(-1,1,1) + (j_grid * self.patch_size + self.patch_size/2) * pixel_width.view(-1,1,1)
+        center_y_abs = origin_y.view(-1,1,1) + (i_grid * self.patch_size + self.patch_size/2) * pixel_height.view(-1,1,1)
 
         # Normalize global coordinates (Web Mercator bounds)
         global_min_x, global_max_x = -20037508.34, 20037508.34

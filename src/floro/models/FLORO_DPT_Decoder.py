@@ -3,17 +3,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from src.models.util.blocks import FeatureFusionBlock, _make_scratch
-from src.models.Model_Components import SelfAttentionBlockViT, trunc_normal_
+from floro.models.util.blocks import FeatureFusionBlock, _make_scratch
+from floro.models.Model_Components import SelfAttentionBlockViT, trunc_normal_
 
 class FLORODPTDecoder(nn.Module):
     def __init__(self, 
-                 image_size=256,
-                 patch_size=16,
-                 d_model=1024,
-                 dec_d_model=768, 
-                 dpt_channels = [256, 512, 1024, 1024],
-                 out_channels=1
+                 image_size: int= 256,
+                 patch_size: int=16,
+                 d_model: int=1024,
+                 dec_d_model: int=768, 
+                 dpt_channels: list= [256, 512, 1024, 1024],
+                 out_channels: int=1,
+                 dropout: float = 0.1,
                  ):
         super().__init__()
         self.patch_size = patch_size
@@ -23,10 +24,14 @@ class FLORODPTDecoder(nn.Module):
         self.d_model = d_model
         self.out_channels = out_channels
         self.dpt_channels = dpt_channels
+        self.dropout = dropout
 
         # Linear projection from encoder to decoder dimension
         self.linear_proj_int_features = nn.Linear(d_model*2, d_model)
         
+        self.h_posemb = self.image_size // patch_size
+        self.w_posemb = self.image_size // patch_size
+ 
         # Mask token
         self.mask_token_feats = nn.Parameter(torch.zeros(1, 1, d_model))
         trunc_normal_(self.mask_token_feats, std=0.02)
@@ -77,11 +82,13 @@ class FLORODPTDecoder(nn.Module):
         self.refinenet3 = FeatureFusionBlock(dec_d_model, nn.ReLU(False))
         self.refinenet2 = FeatureFusionBlock(dec_d_model, nn.ReLU(False))
         self.refinenet1 = FeatureFusionBlock(dec_d_model, nn.ReLU(False))
+        self.refinenet0 = FeatureFusionBlock(dec_d_model, nn.ReLU(False))
 
         # Output convolution
         self.output_conv = nn.Sequential(
             nn.Conv2d(dec_d_model, dec_d_model // 2, kernel_size=3, padding=1),
             nn.ReLU(True),
+            nn.Dropout2d(p=self.dropout),
             nn.Conv2d(dec_d_model // 2, out_channels, kernel_size=1)
         )
     
@@ -152,77 +159,16 @@ class FLORODPTDecoder(nn.Module):
         path4 = self.refinenet4(layer4_rn, size=layer3_rn.shape[2:])        
         path3 = self.refinenet3(path4, layer3_rn, size=layer2_rn.shape[2:])
         path2 = self.refinenet2(path3, layer2_rn, size=layer1_rn.shape[2:])
-        path1 = self.refinenet1(path2, layer1_rn)
+        path1 = self.refinenet1(path2, layer1_rn) # [B,C,image_size //2,image_size //2]
+        path0 = self.refinenet0(path1, size=(self.image_size,self.image_size))
         
         # Final refinement
-        dpt_out = self.refinenet1(path1)
-        dpt_out = self.output_conv(dpt_out)  # [B, C, H, W]
+        
+        dpt_out = self.output_conv(path0)  # [B, C, H, W]
+        #upsampled_features = F.interpolate(dpt_out, scale_factor=2, mode='bilinear', align_corners=False) # [B,C,image_size,image_size]
 
-        return dpt_out
+        return dpt_out#upsampled_features
 
-
-    
-    # @torch.no_grad()
-    # def infer_geotiff(self, image_path, modality_path, input_size=256):
-    #     image, transform, crs, orig_shape = self.image2tensor(image_path, input_size)
-    #     ms_tensor, elevation_tensor, (orig_h, orig_w), transform, crs = self.load_dual_inputs(image_path, modality_path)
-
-    #     # Model prediction
-    #     pred = self.forward(ms_tensor, elevation_tensor, )  # [1, H', W'] ### missing implementation
-    #     pred = F.interpolate(pred[:, None], size=orig_shape, mode='bilinear', align_corners=True)[0, 0]
-
-    #     return pred.cpu().numpy(), transform, crs
-    
-    # def load_dual_inputs(self, image_path_ms, image_path_elevation, input_size=256):
-    #     def load_image(path):
-    #         with rasterio.open(path) as src:
-    #             img = src.read()  # [C, H, W]
-    #             transform = src.transform
-    #             crs = src.crs
-    #         return img, transform, crs
-
-    #     ms_img, transform, crs = load_image(image_path_ms)
-    #     elevation_img, _, _ = load_image(image_path_elevation)
-
-    #     # Normalize
-    #     ms_img = ms_img / 255.0 if ms_img.dtype == torch.uint8 else ms_img.astype(np.float32) * 0.0001 # assuming image in reflectance scaled to 10.000
-    #     elevation_img = elevation_img.astype(np.float32) * 0.0001  # Assuming elevation is in meters scaled 10.000
-
-    #     # Convert to tensors
-    #     ms_tensor = torch.from_numpy(ms_img).float()  # [C, H, W]
-    #     elevation_tensor = torch.from_numpy(elevation_img).float()
-
-    #     # Resize both
-    #     orig_h, orig_w = ms_tensor.shape[1:]
-    #     aspect = orig_h / orig_w
-    #     if aspect >= 1.0:
-    #         target_h = input_size
-    #         target_w = int(input_size / aspect)
-    #     else:
-    #         target_w = input_size
-    #         target_h = int(input_size * aspect)
-
-    #     ms_tensor = F.interpolate(ms_tensor.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=True)[0]
-    #     elevation_tensor = F.interpolate(elevation_tensor.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=True)[0]
-
-    #     ms_tensor = ms_tensor.unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
-    #     elevation_tensor = elevation_tensor.unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
-
-    #     return ms_tensor, elevation_tensor, (orig_h, orig_w), transform, crs
-
-
-    # def save_geotiff(array, transform, crs, path, dtype='float32'):
-    #     with rasterio.open(
-    #         path, 'w',
-    #         driver='GTiff',
-    #         height=array.shape[0],
-    #         width=array.shape[1],
-    #         count=1,
-    #         dtype=dtype,
-    #         crs=crs,
-    #         transform=transform
-    #     ) as dst:
-    #         dst.write(array.astype(dtype), 1)
 
 
 

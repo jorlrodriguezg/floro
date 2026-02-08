@@ -1,7 +1,7 @@
 # Import necessary modules
 import torch
-from src.data.dataloading_ss import LoadersPreparation as LoadersPreparation
-from src.data.self_supervised_dataloader import LoadersPreparation as LoadersPreparationGeo
+from floro.data.dataloading_ss import LoadersPreparation as LoadersPreparation
+from floro.data.self_supervised_dataloader import LoadersPreparation as LoadersPreparationGeo
 # Add imports for your other dataloaders here
 
 def get_dataloaders_seg(batch_size, path_to_data, test_size=0.2, workers=4, device='cuda',  task=None, distributed=None, **kwargs):
