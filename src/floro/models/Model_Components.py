@@ -3,6 +3,14 @@ import torch.nn as nn
 from torch import Tensor
 from itertools import repeat as repeat_tuple
 from einops import rearrange, repeat
+from enum import Enum
+from typing import Optional, Type
+
+class Format(str, Enum):
+    NCHW = 'NCHW'
+    NHWC = 'NHWC'
+    NCL = 'NCL'
+    NLC = 'NLC'
 
 import warnings
 warnings.filterwarnings('ignore', r'All-NaN (slice|axis) encountered')
@@ -41,31 +49,52 @@ def trunc_normal_(tensor, mean=0., std=1.):
         tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
         tensor.data.mul_(std).add_(mean)
 
-class FFN(nn.Module):
-    def __init__(self, d_model, d_inner, norm = nn.LayerNorm, drop=0.1):
+class DropPath(nn.Module):
+    """Stochastic Depth per sample."""
+    def __init__(self, drop_prob: float = 0.0):
         super().__init__()
+        self.drop_prob = float(drop_prob)
 
-        #### Task 1.4
-        #### Feed-forward network
-        #### Define your network here
-        ####
-        self.ffn1 = nn.Linear(d_model, d_inner)
-        self.ffn2 = nn.Linear(d_inner, d_model)
-        self.activ = nn.GELU()
-        self.norm = norm(d_inner) if norm is not None else nn.Identity()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+class LayerScale(nn.Module):
+    def __init__(self, dim: int, init_values: float = 1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+class FFN(nn.Module):
+    """timm/ViT-style MLP, no hidden LayerNorm."""
+    def __init__(
+        self,
+        d_model: int,
+        d_inner: int,
+        act_layer: Type[nn.Module] = nn.GELU,
+        drop: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_inner, bias=bias)
+        self.act = act_layer()
         self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(d_inner, d_model, bias=bias)
         self.drop2 = nn.Dropout(drop)
 
-    def forward(self, x):
-        #### Task 1.4
-        #### Feed-forward network
-        x = self.ffn1(x)
-        x = self.activ(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
         x = self.drop1(x)
-        x = self.norm(x)
-        x = self.ffn2(x)
+        x = self.fc2(x)
         x = self.drop2(x)
-        ####
         return x
         
 # from multimae_utils
@@ -87,6 +116,24 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+def nchw_to(x: torch.Tensor, fmt: Format):
+    """Convert tensor from NCHW format to specified format.
+
+    Args:
+        x: Input tensor in NCHW format.
+        fmt: Target format.
+
+    Returns:
+        Tensor in target format.
+    """
+    if fmt == Format.NHWC:
+        x = x.permute(0, 2, 3, 1)
+    elif fmt == Format.NLC:
+        x = x.flatten(2).transpose(1, 2)
+    elif fmt == Format.NCL:
+        x = x.flatten(2)
+    return x
 
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
@@ -171,21 +218,24 @@ class Attention(nn.Module):
         return x
 
 class SelfAttentionBlockViT(nn.Module):
+    """timm-like pre-norm block (DropPath + optional LayerScale)."""
     def __init__(
-            self,
-            d_model: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
-            mlp_layer: nn.Module = FFN,
-            
-    ) -> None:
+        self,
+        d_model: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        proj_drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        init_values: Optional[float] = None,  # e.g., 1e-5 to enable LayerScale
+        norm_layer: Type[nn.Module] = nn.LayerNorm,
+        mlp_bias: bool = True,
+        proj_bias: bool = True,               # if you expose it in Attention/FFN
+    ):
         super().__init__()
-                
+
         self.norm1 = norm_layer(d_model)
         self.attn = Attention(
             d_model,
@@ -197,13 +247,24 @@ class SelfAttentionBlockViT(nn.Module):
             norm_layer=norm_layer,
         )
 
+        self.ls1 = LayerScale(d_model, init_values) if init_values is not None else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
         self.norm2 = norm_layer(d_model)
-        self.mlp = mlp_layer(d_model, d_model * mlp_ratio, norm = nn.LayerNorm, drop=0.1)
-        
+        self.mlp = FFN(
+            d_model=d_model,
+            d_inner=int(d_model * mlp_ratio),
+            drop=proj_drop,          # IMPORTANT: tie MLP dropout to proj_drop like timm does
+            bias=mlp_bias,
+        )
+        self.ls2 = LayerScale(d_model, init_values) if init_values is not None else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
+
 
 # Multimae
 """
@@ -272,4 +333,54 @@ class CrossAttention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        return x
+
+
+
+class SelfAttentionBlockViT(nn.Module):
+    """timm-like pre-norm block (DropPath + optional LayerScale)."""
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        qk_norm: bool = False,
+        proj_drop: float = 0.0,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.0,
+        init_values: Optional[float] = None,
+        norm_layer: Type[nn.Module] = nn.LayerNorm,
+        mlp_bias: bool = True,
+        proj_bias: bool = True,
+    ):
+        super().__init__()
+
+        self.norm1 = norm_layer(d_model)
+        self.attn = Attention(
+            d_model,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+        )
+
+        self.ls1 = LayerScale(d_model, init_values) if init_values is not None else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(d_model)
+        self.mlp = FFN(
+            d_model=d_model,
+            d_inner=int(d_model * mlp_ratio),
+            drop=proj_drop,          # IMPORTANT: tie MLP dropout to proj_drop like timm does
+            bias=mlp_bias,
+        )
+        self.ls2 = LayerScale(d_model, init_values) if init_values is not None else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x

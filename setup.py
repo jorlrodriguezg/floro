@@ -6,7 +6,7 @@ setup(
     version="0.1.0",
     author="Jorge L. Rodriguez",
     author_email="jorlrodriguezg@gmail.com",
-    description="FLORO: Fusion Learning Of Remote Sensing Observations for Ecological Research",
+    description="A Multimodal Geospatial Foundation Model for Ecological Remote Sensing Across Sensors and Scales",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
     long_description_content_type="text/markdown",
     license="MIT",

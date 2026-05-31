@@ -1,0 +1,70 @@
+_target_: pangaea.datasets.biomassters.BioMassters
+dataset_name: BioMassters
+root_path: ./data/Biomassters
+download_url: 
+auto_download: False
+img_size: 256
+temp: 6 #6 (select month to use if single temporal (multi_temporal : 1))
+multi_temporal: 12
+multi_modal: True
+
+# classes
+ignore_index: -1
+num_classes: 1
+classes:
+  - regression
+distribution:
+  - 1.
+#   - 0.2
+#   - 0.2
+#   - 0.2
+#   - 0.2
+#   - 0.2
+
+bands:
+  optical:
+    - B2
+    - B3
+    - B4
+    - B5
+    - B6
+    - B7
+    - B8
+    - B8A
+    - B11
+    - B12
+    - CLP
+  sar:
+    - VV #set band name to match the input band name of the model e.g. VV for CROMA, ASC_VV for DOFA
+    - VH #set band name to match the input band name of the model e.g. VH for CROMA, ASC_VH for DOFA
+    - DSC_VV
+    - DSC_VH
+
+# TODO: add mean and std normalization values 
+data_mean:
+  optical: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ]
+  sar: [0, 0, 0, 0]
+
+data_std:
+  optical: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ]
+  sar: [0, 0, 0, 0]
+ 
+data_min:
+  optical: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ]
+  sar: [-25, -62, -25, -60]
+
+data_max:
+  optical: [19616., 18400., 17536., 17097., 16928., 16768., 16593., 16492., 15401., 15226.,   255.]
+  sar: [29,  28,  30,  22]
+
+# === Optical stats  ===
+# min : [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# max : [20080.0, 17782.0, 17104.0, 16835.0, 16740.0, 16608.0, 16448.0, 16374.0, 15410.0, 15234.0, 255.0]
+# mean: [433.99836936772437, 567.3999304765387, 569.5736033215404, 925.3648503378491, 1554.6421558855593, 1745.4666378878658, 1906.1552389335654, 1945.1490717767256, 1429.0297207037152, 879.592106210992, 5.047878655675009]
+# std : [956.5010685405703, 875.5022965171412, 943.5487263998738, 966.1039518666362, 1015.750698293419, 1041.207167863418, 1115.344329347636, 1068.207442982044, 790.4412481295227, 598.7286422889807, 19.38824027752747]
+
+# === S1 stats ===
+# min : [-24.999971389770508, -55.7352409362793, -9999.0, -9999.0]
+# max : [26.423768997192383, 27.984493255615234, 29.58452033996582, 21.86574935913086]
+# mean: [-11.02862191076718, -17.28548001087923, -1013.5290382344111, -1019.14069691348]
+# std : [3.2755912891174264, 4.459252501925563, 3001.0919576251085, 2999.2193700431067]

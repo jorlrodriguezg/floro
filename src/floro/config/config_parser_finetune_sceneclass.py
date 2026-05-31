@@ -6,13 +6,14 @@ def get_args_parser():
     parser.add_argument('--wb_project', default="Finetuning", type=str, help="Project name for Wandb")
     parser.add_argument('--run_name', default="Finetuning", type=str, help="Run name for Wandb")
     # Distributed training parameters
-    parser.add_argument('--distributed', default=None, type=str, help='"distributed" to use distributed training')
-    parser.add_argument('--rank', default=os.getenv('LOCAL_RANK', 0), type=int, help='Rank of the process in distributed training')
-    parser.add_argument('--world_size', default=1, type=int, help='Total number of processes to run')
-    parser.add_argument('--node_rank', default=0, type=int, help='Rank of the node for multi-node distributed training')
-    parser.add_argument('--gpu', default=None, type=int, help='GPU to use for training')
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--distributed', action='store_true', help="Enable distributed training")
+    parser.add_argument("--rank", default=int(os.getenv("LOCAL_RANK", 0)), type=int, help="Local rank")
+    parser.add_argument("--world_size", default=int(os.getenv("WORLD_SIZE", 1)), type=int, help="World size")
+    parser.add_argument("--node_rank", default=int(os.getenv("NODE_RANK", 0)), type=int, help="Node rank")
+    parser.add_argument("--gpu", default=None, type=int, help="GPU id to use")
+    parser.add_argument("--dist_on_itp", action="store_true")
+    parser.add_argument("--dist_url", default="env://", type=str, help="url used to set up distributed training")
+
 
     # Dataloaidng
     parser.add_argument('--workers', default=2, type=int, help='Number of workers for dataloading')
@@ -36,8 +37,8 @@ def get_args_parser():
         )
     parser.add_argument('--images_size', default=256, type=int, help='Input image size')
     parser.add_argument('--patch_size', default=16, type=int, help='Size of the patches')
-    parser.add_argument('--input_channels', default=4, type=int, help='Number of input channels (e.g., RGB+NIR)')
-    parser.add_argument('--elev_channels', default=1, type=int, help='Number of elevation channels (e.g., DSM+DTM)')
+    parser.add_argument('--input_channels', default=13, type=int, help='Number of input channels (e.g., RGB+NIR)')
+    parser.add_argument('--elev_channels', default=5, type=int, help='Number of elevation channels (e.g., DSM+DTM)')
     parser.add_argument('--d_model', default=1024, type=int, help='Dimension of the model')
     parser.add_argument('--depth', default=24, type=int, help='Depth of the encoder')
     parser.add_argument('--num_heads', default=16, type=int, help='Number of attention heads')
@@ -51,6 +52,7 @@ def get_args_parser():
     parser.add_argument('--dec_num_heads', default=16, type=int, help='Number of attention heads in decoder')
     parser.add_argument('--pos_embed_type', default='absolute', type=str, help='Type of positional embedding')
     parser.add_argument('--class_names', nargs='+', type=str, default=[], help="List of class names for classification")
+    parser.add_argument('--use_intermediate', action='store_true', help="Use intermediate encoder features in the decoder")
 
     # Finetuning regime
     parser.add_argument('--warmup_epochs', default=50, type=int, help='Number of warm-up epochs')
@@ -82,8 +84,8 @@ def get_args_parser():
     parser.add_argument('--save_checkpoint', action='store_true', dest='save_checkpoint', help='Whether to save checkpoint')
     parser.add_argument('--no_save_checkpoint', action='store_false', dest='save_checkpoint', help='Do not save checkpoint')
     parser.set_defaults(save_checkpoint=True)
-    parser.add_argument('--train_path', default='./data/train', type=str, help='Path to the training data')
-    parser.add_argument('--val_path', default='./data/val', type=str, help='Path to the validation data')
+    parser.add_argument('--train_path', default='', type=str, help='Path to the training data')
+    parser.add_argument('--val_path', default='', type=str, help='Path to the validation data')
     parser.add_argument('--save_dir', default='./checkpoints', type=str, help='Directory to save models')
     parser.add_argument('--save_every', default=10, type=int, help='Save checkpoint every X epochs')
     parser.add_argument('--log_name', default='', type=str, help='Log name to store training metrics')

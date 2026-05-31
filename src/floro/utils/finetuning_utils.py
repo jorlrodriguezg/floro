@@ -8,7 +8,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import nullcontext
 from floro.utils.dist_utils import is_dist_avail_and_initialized, is_main_process, get_rank
+import sklearn.metrics as skmetrics
 
+from torch.amp import autocast
 
 import wandb
 
@@ -514,7 +516,7 @@ def finetune_one_epoch_geo_seg_dpt(
                 enc_out = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
             with amp_ctx:
@@ -524,7 +526,7 @@ def finetune_one_epoch_geo_seg_dpt(
                 enc_out = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
                 logits = model_dec(enc_out)
@@ -740,7 +742,7 @@ def validate_one_epoch_geo_seg_dpt(
             enc_out = model_enc(
                 image_ms, elevation, gt,
                 mask_ratio_ms=getattr(args, "masking_ms", 0.0),
-                mask_ratio_elev=getattr(args, "masking_modality", 0.0),
+                mask_ratio_mods=getattr(args, "masking_modality", 0.0),
                 return_intermediate=True
             )
             logits = model_dec(enc_out)
@@ -927,7 +929,7 @@ def finetune_one_epoch_geo_reg_chmbm(
                 outputs_enc = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
             with amp_ctx:
@@ -937,7 +939,7 @@ def finetune_one_epoch_geo_reg_chmbm(
                 outputs_enc = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
                 prediction = model_dec(outputs_enc)
@@ -1117,7 +1119,7 @@ def validate_one_epoch_finetuning_geo_reg_chmbm(
         with amp_ctx:
             outputs_enc = model_enc(image_ms, elevation, gt,
                                     mask_ratio_ms=args.masking_ms,
-                                    mask_ratio_elev=args.masking_modality,
+                                    mask_ratio_mods=args.masking_modality,
                                     return_intermediate=True)
             prediction = model_dec(outputs_enc)
 
@@ -1246,7 +1248,7 @@ def finetune_one_epoch_geo_reg(
                 outputs_enc = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
             with amp_ctx:
@@ -1256,7 +1258,7 @@ def finetune_one_epoch_geo_reg(
                 outputs_enc = model_enc(
                     image_ms, elevation, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
                 prediction = model_dec(outputs_enc)
@@ -1421,7 +1423,7 @@ def validate_one_epoch_finetuning_geo_reg(
                 outputs_enc = model_enc(
                     image_ms, modality, gt,
                     mask_ratio_ms=mask_ratio_ms,
-                    mask_ratio_elev=mask_ratio_mod,
+                    mask_ratio_mods=mask_ratio_mod,
                     return_intermediate=True
                 )
                 prediction = model_dec(outputs_enc)
@@ -1458,5 +1460,415 @@ def validate_one_epoch_finetuning_geo_reg(
 
     if is_main_process():
         print(f'Validation Loss: {epoch_loss:.4f}')
+
+    return epoch_loss
+
+
+def _normalize_for_display(img: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """
+    Normalize an image to [0, 1] for visualization.
+    Works for HxW or HxWxC arrays.
+    """
+    img = img.astype(np.float32)
+    img_min = np.nanmin(img)
+    img_max = np.nanmax(img)
+    if img_max - img_min < eps:
+        return np.zeros_like(img, dtype=np.float32)
+    return np.clip((img - img_min) / (img_max - img_min), 0.0, 1.0)
+
+
+def log_scene_classification_wandb(
+    image_tensor,
+    elev_tensor,
+    pred_logits,
+    gt_tensor,
+    args,
+    cam=None,
+    max_items=1,
+    log_gt_cam_when_wrong=True,
+):
+    """
+    Log scene classification examples to W&B with optional CAM heatmaps.
+
+    Args:
+        image_tensor (torch.Tensor): [B, C, H, W]
+        elev_tensor (torch.Tensor | None): [B, 1, H, W] or None
+        pred_logits (torch.Tensor): [B, num_classes]
+        gt_tensor (torch.Tensor): [B]
+        args: must contain class_names
+        cam (torch.Tensor | None): [B, num_classes, Hc, Wc]
+        max_items (int): number of samples from batch to log
+        log_gt_cam_when_wrong (bool): if True, also show GT CAM when prediction is wrong
+    """
+    if isinstance(args.class_names, str):
+        class_names = [name.strip() for name in args.class_names.split(",")]
+    else:
+        class_names = list(args.class_names)
+
+    batch_size = image_tensor.shape[0]
+    n_items = min(batch_size, max_items)
+
+    logs = {}
+
+    for b in range(n_items):
+        # --------- image selection for display ---------
+        # EuroSAT-MS suggested false color from your current convention: [3,2,1]
+        # Adjust if needed depending on your band order.
+        rgb = image_tensor[b][[3, 2, 1], :, :].detach().cpu().permute(1, 2, 0).numpy()
+        rgb = _normalize_for_display(rgb)
+
+        elev_img = None
+        if elev_tensor is not None:
+            elev_img = elev_tensor[b, 0].detach().cpu().numpy()
+            elev_img = _normalize_for_display(elev_img)
+
+        # --------- decode labels ---------
+        pred_class_idx = torch.argmax(pred_logits[b]).item()
+        gt_class_idx = gt_tensor[b].view(-1)[0].item() if gt_tensor[b].ndim > 0 else gt_tensor[b].item()
+
+        pred_label = class_names[pred_class_idx]
+        gt_label = class_names[gt_class_idx]
+
+        correct = (pred_class_idx == gt_class_idx)
+
+        # --------- build figure layout ---------
+        show_cam = cam is not None
+        show_gt_cam = show_cam and log_gt_cam_when_wrong and (not correct)
+
+        if elev_img is not None and show_gt_cam:
+            ncols = 4
+        elif elev_img is not None or show_gt_cam:
+            ncols = 3
+        else:
+            ncols = 2 if show_cam else 1
+
+        fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4), dpi=100)
+        if ncols == 1:
+            axes = [axes]
+        else:
+            axes = np.atleast_1d(axes)
+
+        col = 0
+
+        # --------- panel 1: RGB / false color ---------
+        axes[col].imshow(rgb)
+        axes[col].axis("off")
+        axes[col].set_title("Input")
+        col += 1
+
+        # --------- panel 2: elevation ---------
+        if elev_img is not None:
+            ls = LightSource(azdeg=315, altdeg=45)
+            shaded = ls.shade(elev_img, cmap=plt.cm.gist_earth, blend_mode="hsv", vert_exag=2)
+            axes[col].imshow(shaded)
+            axes[col].axis("off")
+            axes[col].set_title("Elevation")
+            col += 1
+
+        # --------- panel 3: predicted CAM overlay ---------
+        if show_cam:
+            pred_cam = cam[b, pred_class_idx].detach().float().cpu()  # [Hc, Wc]
+            pred_cam = pred_cam.unsqueeze(0).unsqueeze(0)  # [1,1,Hc,Wc]
+            pred_cam = F.interpolate(
+                pred_cam,
+                size=(rgb.shape[0], rgb.shape[1]),
+                mode="bilinear",
+                align_corners=False
+            ).squeeze().numpy()
+
+            pred_cam = _normalize_for_display(pred_cam)
+
+            axes[col].imshow(rgb)
+            axes[col].imshow(pred_cam, alpha=0.45, cmap="jet")
+            axes[col].axis("off")
+            axes[col].set_title(f"Pred CAM: {pred_label}")
+            col += 1
+
+        # --------- panel 4: GT CAM overlay when wrong ---------
+        if show_gt_cam:
+            gt_cam = cam[b, gt_class_idx].detach().float().cpu()
+            gt_cam = gt_cam.unsqueeze(0).unsqueeze(0)
+            gt_cam = F.interpolate(
+                gt_cam,
+                size=(rgb.shape[0], rgb.shape[1]),
+                mode="bilinear",
+                align_corners=False
+            ).squeeze().numpy()
+
+            gt_cam = _normalize_for_display(gt_cam)
+
+            axes[col].imshow(rgb)
+            axes[col].imshow(gt_cam, alpha=0.45, cmap="jet")
+            axes[col].axis("off")
+            axes[col].set_title(f"GT CAM: {gt_label}")
+            col += 1
+
+        # --------- figure title ---------
+        if correct:
+            title_text = f"✓ Pred: {pred_label} | GT: {gt_label}"
+            title_color = "green"
+        else:
+            title_text = f"✗ Pred: {pred_label} | GT: {gt_label}"
+            title_color = "red"
+
+        fig.suptitle(title_text, fontsize=12, color=title_color)
+        plt.tight_layout()
+
+        logs[f"scene_classification/sample_{b}"] = wandb.Image(fig)
+        plt.close(fig)
+
+    wandb.log(logs)
+
+
+
+def finetune_one_epoch_geo(
+    model_enc,
+    model_dec,
+    dataloader,
+    optimizer_enc,
+    optimizer_dec,
+    criterion,
+    device,
+    args,
+    scaler=None
+):
+    decoder_only = (args.train_mode == "decoder_only")
+
+    if decoder_only:
+        print("Freezing encoder parameters and setting encoder to evaluation mode.")
+        for param in model_enc.parameters():
+            param.requires_grad = False
+        model_enc.eval()
+        optimizer_enc = None
+    else:
+        model_enc.train()
+
+    model_dec.train()
+
+    if optimizer_enc is not None:
+        optimizer_enc.zero_grad(set_to_none=True)
+    optimizer_dec.zero_grad(set_to_none=True)
+
+    running_loss = 0.0
+    accumulation_steps = args.accumulation_steps
+
+    for i, batch in enumerate(dataloader):
+        image_ms = batch["image"].to(device, non_blocking=True)
+        modalities = batch["modalities"].to(device, non_blocking=True)
+
+        has_modalities = bool(batch["has_modalities"][0].item())
+        #print(has_modalities)
+        if not has_modalities:
+            #print("No modalities")
+            modalities = None
+
+        if args.task == "segmentation":
+            target = batch["target"].squeeze(1).to(device, non_blocking=True).long()
+        elif args.task == "classification":
+            target = batch["target"].to(device, non_blocking=True).view(-1).long()
+        else:
+            target = batch["target"].to(device, non_blocking=True)
+            nan_inf_mask = torch.isnan(target) | torch.isinf(target)
+            if nan_inf_mask.any():
+                target = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+        gt = batch["geo_transform"].to(device, non_blocking=True)
+
+        # Recommended for downstream finetuning:
+        mask_ratio_ms = 0.0
+        mask_ratio_mod = 0.0
+
+        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")) if args.use_autocast else nullcontext():
+            outputs_enc = model_enc(
+                image_ms,
+                modalities,
+                gt,
+                mask_ratio_ms=mask_ratio_ms,
+                mask_ratio_mods=mask_ratio_mod,
+                return_intermediate=True
+            )
+
+            prediction = model_dec(outputs_enc)
+
+            if args.task in ["segmentation", "classification"]:
+                loss = criterion(prediction, target)
+            else:
+                loss = criterion(prediction.float(), target.float())
+
+        if torch.isfinite(loss):
+            loss_to_backprop = loss / accumulation_steps
+
+            if args.use_autocast and scaler is not None:
+                scaler.scale(loss_to_backprop).backward()
+            else:
+                loss_to_backprop.backward()
+
+            if (i + 1) % accumulation_steps == 0:
+                if decoder_only:
+                    if args.use_autocast and scaler is not None:
+                        scaler.step(optimizer_dec)
+                        scaler.update()
+                    else:
+                        optimizer_dec.step()
+                    optimizer_dec.zero_grad(set_to_none=True)
+                else:
+                    if args.use_autocast and scaler is not None:
+                        scaler.step(optimizer_enc)
+                        scaler.step(optimizer_dec)
+                        scaler.update()
+                    else:
+                        optimizer_enc.step()
+                        optimizer_dec.step()
+
+                    optimizer_enc.zero_grad(set_to_none=True)
+                    optimizer_dec.zero_grad(set_to_none=True)
+
+            running_loss += loss.item() * image_ms.size(0)
+
+    # Final partial accumulation step
+    remainder = len(dataloader) % accumulation_steps
+    if remainder != 0:
+        if decoder_only:
+            if args.use_autocast and scaler is not None:
+                scaler.step(optimizer_dec)
+                scaler.update()
+            else:
+                optimizer_dec.step()
+            optimizer_dec.zero_grad(set_to_none=True)
+        else:
+            if args.use_autocast and scaler is not None:
+                scaler.step(optimizer_enc)
+                scaler.step(optimizer_dec)
+                scaler.update()
+            else:
+                optimizer_enc.step()
+                optimizer_dec.step()
+
+            optimizer_enc.zero_grad(set_to_none=True)
+            optimizer_dec.zero_grad(set_to_none=True)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    print(f"Training Loss: {epoch_loss:.4f}")
+
+    return epoch_loss
+
+def validate_one_epoch_finetuning_geo(
+    model_enc,
+    model_dec,
+    dataloader,
+    criterion,
+    device,
+    args,
+    log_preds_wb: bool = False,
+    return_cam: bool = False,
+):
+    model_enc.eval()
+    model_dec.eval()
+
+
+    running_loss = 0.0
+    split_name = getattr(args, "split", "val")
+    rank = getattr(args, "rank", 0)
+
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")) if args.use_autocast else nullcontext():
+            
+            epoch_preds = []
+            epoch_targets = []
+            epoch_correct = 0
+            epoch_samples = 0
+
+            for batch_idx, batch in enumerate(dataloader):
+                image_ms = batch["image"].to(device, non_blocking=True)
+                modalities = batch["modalities"].to(device, non_blocking=True)
+
+                has_modalities = bool(batch["has_modalities"][0].item())
+                #print(has_modalities)
+                if not has_modalities:
+                    #print("No modalities")
+                    modalities = None
+
+                if args.task == "segmentation":
+                    target = batch["target"].squeeze(1).to(device, non_blocking=True).long()
+                elif args.task == "classification":
+                    target = batch["target"].to(device, non_blocking=True).view(-1).long()
+                else:
+                    target = batch["target"].to(device, non_blocking=True)
+                    nan_inf_mask = torch.isnan(target) | torch.isinf(target)
+                    if nan_inf_mask.any():
+                        target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
+
+                gt = batch["geo_transform"].to(device, non_blocking=True)
+
+                # Recommended for downstream validation:
+                mask_ratio_ms = 0.0
+                mask_ratio_mod = 0.0
+
+                outputs_enc = model_enc(
+                    image_ms,
+                    modalities,
+                    gt,
+                    mask_ratio_ms=mask_ratio_ms,
+                    mask_ratio_mods=mask_ratio_mod,
+                    return_intermediate=True
+                )
+
+                prediction = model_dec(outputs_enc, return_cam=return_cam)
+
+                if return_cam:
+                    logits, cam = prediction
+                else:
+                    logits = prediction
+                    cam = None
+
+                if args.task in ["segmentation", "classification"]:
+                    loss = criterion(logits, target)
+                else:
+                    loss = criterion(logits.float(), target.float())
+
+                if torch.isfinite(loss):
+                    running_loss += loss.item() * image_ms.size(0)
+
+                # Evaluate accuracy
+                preds = torch.argmax(logits, dim=1)
+                epoch_correct += (preds == target).sum().item()
+                epoch_samples += target.numel()
+                epoch_preds.append(preds.cpu().numpy())
+                epoch_targets.append(target.cpu().numpy())
+
+                if log_preds_wb:
+                    if args.task == "segmentation":
+                        log_image_wandb(image_ms, logits, target)
+                    elif args.task == "classification":
+                        log_scene_classification_wandb(
+                            image_ms, modalities, logits, target, args, cam=cam
+                        )
+                    else:
+                        log_image_reg_wandb(image_ms, modalities, logits, target)
+
+            epoch_preds = np.concatenate(epoch_preds, axis=0)
+            epoch_targets = np.concatenate(epoch_targets, axis=0)
+            
+            # Overall accuracy.
+            accuracy = epoch_correct / epoch_samples if epoch_samples > 0 else 0
+
+            precision, recall, f1, _ = skmetrics.precision_recall_fscore_support(
+                epoch_targets,
+                epoch_preds,
+                labels=list(range(args.num_classes)),
+                average="macro",
+                zero_division=0
+            )
+            
+            metrics = {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "F1": f1,
+            }
+            wandb.log(metrics)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    print(f"Validation Loss: {epoch_loss:.4f}")
 
     return epoch_loss

@@ -66,6 +66,237 @@ def tensor_stats(t: torch.Tensor, name: str):
             f"valid={n_valid}/{numel} min={mn:.6g} max={mx:.6g} mean={mean:.6g}"
         )
 
+def train_one_epoch_geo_ss(
+    model_enc,
+    model_dec,
+    dataloader,
+    optimizer_enc,
+    optimizer_dec,
+    criterion,
+    device,
+    scaler,
+    args,
+):
+    model_enc.train()
+    model_dec.train()
+
+    running_loss = 0.0
+    accumulation_steps = args.accumulation_steps
+
+    optimizer_enc.zero_grad(set_to_none=True)
+    optimizer_dec.zero_grad(set_to_none=True)
+
+    base_mask_ratio_ms = getattr(args, "mask_ratio_ms", 0.75)
+    base_mask_ratio_mod = getattr(args, "mask_ratio_mod", 0.70)
+
+    lambda_ms = getattr(args, "lambda_ms", 1.0)
+    lambda_mod = getattr(args, "lambda_mod", 0.5)
+    lambda_sar = getattr(args, "lambda_sar", 0.5)
+
+    for i, batch in enumerate(dataloader):
+        opt_in = batch["image"].to(device, non_blocking=True)         # [B,13,H,W]
+        geo_in = batch["modalities"].to(device, non_blocking=True)    # [B, 5,H,W]
+        gt = batch["geo_transform"].to(device, non_blocking=True)
+
+        assert opt_in.shape[1] == args.image_channels  # 13
+        assert geo_in.shape[1] == args.modality_channels  # 5
+
+        # Targets (NO validity)
+        tgt_ms = opt_in[:, 0:8]      # [B,8,H,W]
+        tgt_mod = geo_in[:, 0:3]      # [B,3,H,W]
+
+        # Validity maps (group-level maps assumed constant 0/1)
+        vBGR  = opt_in[:, 8:9]        # [B,1,H,W]
+        vRE   = opt_in[:, 9:10]
+        vNIR  = opt_in[:, 10:11]
+        vNIR2 = opt_in[:, 11:12]
+        vSWIR = opt_in[:, 12:13]
+
+        vELEV = geo_in[:, 3:4]        # [B,1,H,W]
+        vSAR  = geo_in[:, 4:5]
+
+        # Per-sample validity flags (mean over spatial)
+        valid_ms = torch.cat(
+            [vBGR.mean((2,3)), vRE.mean((2,3)), vNIR.mean((2,3)), vNIR2.mean((2,3)), vSWIR.mean((2,3))],
+            dim=1
+        )  # [B,5]
+        valid_mod = torch.cat([vELEV.mean((2,3)), vSAR.mean((2,3))], dim=1)  # [B,2]
+
+        # Optional jitter
+        if getattr(args, "mask_ratio_jitter", 0.0) > 0:
+            j = args.mask_ratio_jitter
+            mask_ratio_ms = float(np.clip(base_mask_ratio_ms + np.random.uniform(-j, j), 0.5, 0.95))
+            mask_ratio_mod = float(np.clip(base_mask_ratio_mod + np.random.uniform(-j, j), 0.5, 0.95))
+        else:
+            mask_ratio_ms = base_mask_ratio_ms
+            mask_ratio_mod = base_mask_ratio_mod
+
+        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            enc_out = model_enc(
+                opt_in,
+                geo_in,
+                gt,
+                mask_ratio_ms=mask_ratio_ms,
+                mask_ratio_mods=mask_ratio_mod,
+            )
+
+            reconstructed_ms, reconstructed_mod = model_dec(enc_out, gt)
+            # Expect: reconstructed_ms [B,8,H,W], reconstructed_mod [B,3,H,W]
+            assert reconstructed_ms.shape[1] == args.output_image_channels  # 8
+            assert reconstructed_mod.shape[1] == args.output_modality_channels  # 3
+
+            # Pixel masks for masked-only loss (make sure apply_mask_loss returns bool mask matching targets!)
+            mask_ms_pix = apply_mask_loss(tgt_ms, enc_out["mask_multi"], patch_size=args.patch_size)       # [B,8,H,W] bool
+            mask_mod_pix = apply_mask_loss(tgt_mod, enc_out["mask_modalities"], patch_size=args.patch_size) # [B,3,H,W] bool
+
+            # Batch-level group gates (5 optical groups now)
+            w_bgr  = valid_ms[:, 0].float().mean()
+            w_re   = valid_ms[:, 1].float().mean()
+            w_nir  = valid_ms[:, 2].float().mean()
+            w_nir2 = valid_ms[:, 3].float().mean()
+            w_swir = valid_ms[:, 4].float().mean()
+            denom_ms = (w_bgr + w_re + w_nir + w_nir2 + w_swir).clamp_min(1e-6)
+
+            w_elev = valid_mod[:, 0].float().mean()
+            w_sar  = valid_mod[:, 1].float().mean()
+            denom_mod = (w_elev + w_sar).clamp_min(1e-6)
+
+            # Optical losses (masked only)
+            def masked_mse(pred, tgt, mask):
+                return criterion(pred[mask], tgt[mask]) if mask.any() else torch.tensor(0.0, device=device)
+
+            bgr_loss  = masked_mse(reconstructed_ms[:, 0:3], tgt_ms[:, 0:3], mask_ms_pix[:, 0:3])
+            re_loss   = masked_mse(reconstructed_ms[:, 3:4], tgt_ms[:, 3:4], mask_ms_pix[:, 3:4])
+            nir_loss  = masked_mse(reconstructed_ms[:, 4:5], tgt_ms[:, 4:5], mask_ms_pix[:, 4:5])
+            nir2_loss = masked_mse(reconstructed_ms[:, 5:6], tgt_ms[:, 5:6], mask_ms_pix[:, 5:6])
+            swir_loss = masked_mse(reconstructed_ms[:, 6:8], tgt_ms[:, 6:8], mask_ms_pix[:, 6:8])
+
+            opt_loss = (w_bgr*bgr_loss + w_re*re_loss + w_nir*nir_loss + w_nir2*nir2_loss + w_swir*swir_loss) / denom_ms
+
+            # Geo losses (masked only)
+            elev_loss = masked_mse(reconstructed_mod[:, 0:1], tgt_mod[:, 0:1], mask_mod_pix[:, 0:1])
+            sar_loss  = masked_mse(reconstructed_mod[:, 1:3], tgt_mod[:, 1:3], mask_mod_pix[:, 1:3])
+
+            geo_loss = (w_elev * elev_loss + (w_sar * lambda_sar) * sar_loss) / denom_mod
+
+            total_loss = lambda_ms * opt_loss + lambda_mod * geo_loss
+
+        if not torch.isnan(total_loss):
+            scaler.scale(total_loss).backward()
+
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer_enc)
+                scaler.step(optimizer_dec)
+                scaler.update()
+                optimizer_enc.zero_grad(set_to_none=True)
+                optimizer_dec.zero_grad(set_to_none=True)
+
+            running_loss += total_loss.item() * opt_in.size(0)
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    print(f"Training Loss: {epoch_loss:.4f}")
+    return epoch_loss
+
+
+def validate_one_epoch_geo_ss(
+    model_enc,
+    model_dec,
+    dataloader,
+    criterion,
+    device,
+    args,
+):
+    model_enc.eval()
+    model_dec.eval()
+
+    running_loss = 0.0
+    running_ms = 0.0
+    running_mod = 0.0
+
+    mask_ratio_ms = getattr(args, "mask_ratio_ms", 0.75)
+    mask_ratio_mod = getattr(args, "mask_ratio_mod", 0.70)
+
+    lambda_ms = getattr(args, "lambda_ms", 1.0)
+    lambda_mod = getattr(args, "lambda_mod", 0.5)
+    lambda_sar = getattr(args, "lambda_sar", 0.5)
+
+    with torch.no_grad():
+        for batch in dataloader:
+            opt_in = batch["image"].to(device, non_blocking=True)         # [B,13,H,W]
+            geo_in = batch["modalities"].to(device, non_blocking=True)    # [B, 5,H,W]
+            gt = batch["geo_transform"].to(device, non_blocking=True)
+
+            tgt_ms = opt_in[:, 0:8]
+            tgt_mod = geo_in[:, 0:3]
+
+            vBGR  = opt_in[:, 8:9]
+            vRE   = opt_in[:, 9:10]
+            vNIR  = opt_in[:, 10:11]
+            vNIR2 = opt_in[:, 11:12]
+            vSWIR = opt_in[:, 12:13]
+
+            vELEV = geo_in[:, 3:4]
+            vSAR  = geo_in[:, 4:5]
+
+            valid_ms = torch.cat(
+                [vBGR.mean((2,3)), vRE.mean((2,3)), vNIR.mean((2,3)), vNIR2.mean((2,3)), vSWIR.mean((2,3))],
+                dim=1
+            )
+            valid_mod = torch.cat([vELEV.mean((2,3)), vSAR.mean((2,3))], dim=1)
+
+            with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                enc_out = model_enc(
+                    opt_in,
+                    geo_in,
+                    gt,
+                    mask_ratio_ms=mask_ratio_ms,
+                    mask_ratio_mods=mask_ratio_mod,
+                )
+
+                reconstructed_ms, reconstructed_mod = model_dec(enc_out, gt)
+
+                mask_ms_pix = apply_mask_loss(tgt_ms, enc_out["mask_multi"], patch_size=args.patch_size)       # [B,8,H,W]
+                mask_mod_pix = apply_mask_loss(tgt_mod, enc_out["mask_modalities"], patch_size=args.patch_size) # [B,3,H,W]
+
+                w_bgr  = valid_ms[:, 0].float().mean()
+                w_re   = valid_ms[:, 1].float().mean()
+                w_nir  = valid_ms[:, 2].float().mean()
+                w_nir2 = valid_ms[:, 3].float().mean()
+                w_swir = valid_ms[:, 4].float().mean()
+                denom_ms = (w_bgr + w_re + w_nir + w_nir2 + w_swir).clamp_min(1e-6)
+
+                w_elev = valid_mod[:, 0].float().mean()
+                w_sar  = valid_mod[:, 1].float().mean()
+                denom_mod = (w_elev + w_sar).clamp_min(1e-6)
+
+                def masked_mse(pred, tgt, mask):
+                    return criterion(pred[mask], tgt[mask]) if mask.any() else torch.tensor(0.0, device=device)
+
+                bgr_loss  = masked_mse(reconstructed_ms[:, 0:3], tgt_ms[:, 0:3], mask_ms_pix[:, 0:3])
+                re_loss   = masked_mse(reconstructed_ms[:, 3:4], tgt_ms[:, 3:4], mask_ms_pix[:, 3:4])
+                nir_loss  = masked_mse(reconstructed_ms[:, 4:5], tgt_ms[:, 4:5], mask_ms_pix[:, 4:5])
+                nir2_loss = masked_mse(reconstructed_ms[:, 5:6], tgt_ms[:, 5:6], mask_ms_pix[:, 5:6])
+                swir_loss = masked_mse(reconstructed_ms[:, 6:8], tgt_ms[:, 6:8], mask_ms_pix[:, 6:8])
+
+                opt_loss = (w_bgr*bgr_loss + w_re*re_loss + w_nir*nir_loss + w_nir2*nir2_loss + w_swir*swir_loss) / denom_ms
+
+                elev_loss = masked_mse(reconstructed_mod[:, 0:1], tgt_mod[:, 0:1], mask_mod_pix[:, 0:1])
+                sar_loss  = masked_mse(reconstructed_mod[:, 1:3], tgt_mod[:, 1:3], mask_mod_pix[:, 1:3])
+                geo_loss = (w_elev * elev_loss + (w_sar * lambda_sar) * sar_loss) / denom_mod
+
+                total_loss = lambda_ms * opt_loss + lambda_mod * geo_loss
+
+            running_loss += total_loss.item() * opt_in.size(0)
+            running_ms  += opt_loss.item() * opt_in.size(0)
+            running_mod  += geo_loss.item() * opt_in.size(0)
+
+    n = len(dataloader.dataset)
+    epoch_loss = running_loss / n
+    epoch_ms  = running_ms  / n
+    epoch_mod  = running_mod  / n
+    print(f"Validation Loss: {epoch_loss:.4f} | opt: {epoch_ms:.4f} | geo: {epoch_mod:.4f}")
+    return epoch_loss
+
 def train_one_epoch(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion1, criterion2, device, scaler, args):
     model_enc.train()  # Set the encoder to training mode
     model_dec.train()  # Set the decoder to training mode
@@ -560,65 +791,6 @@ def log_image_wandb(image_tensor, pred_seg_tensor, seg_gt_tensor):
     })
 
 
-def log_scene_classification_wandb(image_tensor, elev_tensor, pred_logits, gt_tensor, args):
-    """
-    Logs a multispectral image and elevation with predicted vs. ground truth class.
-
-    Args:
-        image_tensor (torch.Tensor): [1, C, H, W]
-        elev_tensor (torch.Tensor): [1, 1, H, W]
-        pred_logits (torch.Tensor): [B, num_classes]
-        gt_tensor (torch.Tensor): [B]
-        args: Argument object with class_names list
-    """
-    # Extract RGB (NIR, R, G) from channels
-    np_image = image_tensor[0][[3, 2, 1], :, :].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-    elev_image = elev_tensor[0, 0].detach().cpu().numpy()  # [H, W]
-
-    # Decode predictions
-    pred_class_idx = torch.argmax(pred_logits, dim=1)[0].item()
-    gt_class_idx = gt_tensor[0].item()
-
-    class_names = args.class_names
-    # Ensure class_names is parsed as a list, even if passed as a comma-separated string
-    if isinstance(args.class_names, str):
-        args.class_names = [name.strip() for name in args.class_names.split(",")]
-    
-    pred_label = class_names[pred_class_idx]
-    gt_label = class_names[gt_class_idx]
-    
-
-    # Visualization
-    ls = LightSource(azdeg=315, altdeg=45)
-    cmap = plt.cm.gist_earth
-    fig, ax = plt.subplots(1, 2, figsize=(6, 3), dpi=72)
-
-    ax[0].imshow(np_image)
-    ax[0].axis('off')
-    ax[0].set_title("Multispectral")
-
-    ax[1].imshow(ls.shade(elev_image, cmap=cmap, blend_mode='hsv', vert_exag=2))
-    ax[1].axis('off')
-    ax[1].set_title("Elevation")
-
-    # Title
-    if pred_class_idx == gt_class_idx:
-        title_text = f"✓ {pred_label}"
-        title_color = "green"
-    else:
-        title_text = f"✗ Pred: {pred_label} | GT: {gt_label}"
-        title_color = "red"
-
-    fig.suptitle(title_text, fontsize=12, color=title_color)
-    plt.tight_layout()
-
-    wandb.log({
-        "scene_classification": wandb.Image(fig)
-    })
-    plt.close(fig)
-
-
-
 
 def log_image_reg_wandb(image_tensor, elev_tensor, pred_reg_tensor, gt_reg_tensor):
     np_image = image_tensor[0][[3, 2, 1], :, :].permute(1, 2, 0).cpu().numpy()  # [H,W,3]
@@ -664,186 +836,6 @@ def log_image_reg_wandb(image_tensor, elev_tensor, pred_reg_tensor, gt_reg_tenso
     plt.close(fig)
 
 
-def finetune_one_epoch_geo(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion, device, args, scaler=None):
-    if args.train_mode == "decoder_only":
-        print("Freezing encoder parameters and setting encoder to evaluation mode.")
-        for param in model_enc.parameters():
-            param.requires_grad = False
-        model_enc.eval()  # Set encoder to evaluation mode.
-        optimizer_dec.zero_grad()
-        optimizer_enc = None
-    else:
-        model_enc.train()
-        optimizer_enc.zero_grad()
-        optimizer_dec.zero_grad()
-
-    model_dec.train()  # Set the decoder to training mode
-
-    running_loss = 0.0
-    accumulation_steps = args.accumulation_steps  # Number of steps to accumulate gradients
-
-    #optimizer.zero_grad()
-    
-    for i, batch in enumerate(dataloader):
-        image_ms = batch['image'].to(device)
-        elevation = batch['elevation'].to(device)
-        if args.task == 'segmentation':  
-            target = batch['target'].squeeze(1).to(device).long()
-            #print(target.shape)
-            #print("Target unique vals:", target.unique())
-        elif args.task == 'classification':
-            target = batch['target'].to(device)
-            target = target.view(-1).long()  # in case it has shape [B, 1]
-        else:
-            target = batch['target'].to(device)
-            # Check and handle NaN or Inf explicitly
-            nan_inf_mask = torch.isnan(target) | torch.isinf(target)    
-            if nan_inf_mask.any():
-                #print(f"Detected NaN or inf in targets at batch index {i}. Handling...")
-                target = torch.nan_to_num(target, nan=0.0, posinf=0, neginf=0)
-        
-        #target_labels = batch['clusters'].to(device).long()
-        gt = batch['geo_transform'].to(device)
-        # We want the model to see as much of the image context as possible
-        
-        mask_ratio_ms = args.masking_ms
-        mask_ratio_mod = args.masking_modality
-        
-        context = autocast() if args.use_autocast else torch.no_grad()  # no_grad won't compute grads, so we need just normal context if no autocast
-        with context if args.use_autocast else nullcontext():
-            # Encode and decode the representations
-            outputs_enc, mask_multi, mask_modality, ids_restore_multi, ids_restore_modality = model_enc(image_ms, elevation, gt, mask_ratio_ms=mask_ratio_ms, mask_ratio_elev=mask_ratio_mod)
-            prediction = model_dec(outputs_enc, mask_multi, mask_modality, ids_restore_multi, ids_restore_modality, gt)
-
-            if args.task == 'segmentation':
-                loss = criterion(prediction, target)
-            elif args.task == 'classification':
-                loss = criterion(prediction, target)
-            else:
-                loss = criterion(prediction.float(), target.float())
-            
-        # Backward pass
-        if not torch.isnan(loss) and not torch.isinf(loss):
-            if args.use_autocast and scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            if (i + 1) % args.accumulation_steps == 0:
-                if args.train_mode == "decoder_only":
-                    if args.use_autocast and scaler is not None:
-                        scaler.step(optimizer_dec)
-                        scaler.update()
-                    else:
-                        optimizer_dec.step()
-                    optimizer_dec.zero_grad()
-                else:
-                    if args.use_autocast and scaler is not None:
-                        scaler.step(optimizer_enc)
-                        scaler.step(optimizer_dec)
-                        scaler.update()
-                    else:
-                        optimizer_enc.step()
-                        optimizer_dec.step()
-                    optimizer_enc.zero_grad()
-                    optimizer_dec.zero_grad()
-        
-            running_loss += loss.item() * image_ms.size(0)   
-        
-    epoch_loss = running_loss / len(dataloader.dataset)
-
-    print(f'Training Loss: {epoch_loss:.4f}')
-
-    return epoch_loss
-
-def validate_one_epoch_finetuning_geo(model_enc, model_dec, dataloader, criterion, device, args, log_preds_wb = False):
-    """
-    Validate the model for one epoch.
-    
-    This function sets the encoder and decoder to evaluation mode, and it uses
-    torch.no_grad() (with optional autocast) to perform inference. It computes the 
-    loss over the validation dataset without updating any model parameters.
-    
-    Parameters:
-      model_enc: The encoder model.
-      model_dec: The decoder model.
-      dataloader: DataLoader for the validation dataset.
-      criterion: Loss function (e.g., nn.CrossEntropyLoss).
-      device: The device (CPU or GPU) for computations.
-      args: Additional arguments (e.g., task type, fine-tune mode).
-      
-    Returns:
-      epoch_loss: The average loss for the validation epoch.
-    """
-    
-    # for param in model_enc.parameters():
-    #     param.requires_grad = False
-    # model_enc.eval()
-    # for param in model_dec.parameters():
-    #     param.requires_grad = False
-    # model_dec.eval()
-    
-    running_loss = 0.0
-
-    # Disable gradient computation for validation.
-    with torch.no_grad():
-        # Optionally use autocast for mixed precision inference.
-        with autocast():
-            for batch_idx, batch in enumerate(dataloader):
-                # Get the input data and send to device.
-                image_ms = batch['image'].to(device)
-                elevation = batch['elevation'].to(device)
-                
-                # For segmentation tasks using CrossEntropyLoss, targets should be long.
-                if args.task == 'segmentation':  
-                    target = batch['target'].squeeze(1).to(device).long()
-                elif args.task == 'classification':
-                    target = batch['target'].to(device)
-                    target = target.view(-1).long()  # Handle [B, 1] or scalar
-                else:
-                    target = batch['target'].to(device)
-                    # Check and handle NaN or Inf explicitly
-                    nan_inf_mask = torch.isnan(target) | torch.isinf(target)    
-                    if nan_inf_mask.any():
-                        #print(f"Detected NaN or inf in targets at batch index {i}. Handling...")
-                        target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
-                
-                gt = batch['geo_transform'].to(device)
-                
-                # During validation, we usually let the model see the full input.
-                mask_ratio_ms = args.masking_ms
-                mask_ratio_mod = args.masking_modality
-                
-                # Forward pass through encoder and decoder.
-                outputs_enc, mask_multi, mask_modality, ids_restore_multi, ids_restore_modality = model_enc(image_ms, elevation, gt, mask_ratio_ms=mask_ratio_ms, mask_ratio_elev=mask_ratio_mod)
-                prediction = model_dec(outputs_enc, mask_multi, mask_modality, ids_restore_multi, ids_restore_modality, gt)
-                
-                # Process the batch on a per-sample basis
-                # batch_size = image_ms.shape[0]
-                # losses = []
-                
-                # for i in range(batch_size):
-                #     loss_sample = criterion(prediction[i], target[i])
-                #     losses.append(loss_sample)    
-                # # Average the losses over the batch
-                # loss = sum(losses) / batch_size
-                loss = criterion(prediction, target)
-                if not torch.isnan(loss) and not torch.isinf(loss):
-                    running_loss += loss.item() * image_ms.size(0)
-                # Log image to W&B
-                if log_preds_wb == True:
-                    if args.task == 'segmentation': 
-                        log_image_wandb(image_ms, prediction, target)
-                    elif args.task == 'classification':
-                        log_scene_classification_wandb(image_ms, elevation, prediction, target, args)
-                    else:
-                        log_image_reg_wandb(image_ms, elevation, prediction, target)
-                
-    
-    # Compute the epoch's average loss.
-    epoch_loss = running_loss / len(dataloader.dataset)
-    print(f'Validation Loss: {epoch_loss:.4f}')
-    
-    return epoch_loss
 
 def finetune_one_epoch_hybrid(model_enc, model_dec, dataloader, optimizer_enc, optimizer_dec, criterion, device, args, scaler=None):
     if args.train_mode == "decoder_only":
@@ -1275,104 +1267,7 @@ def validate_one_epoch_finetuning_geo_sc(model_enc, model_dec, dataloader, crite
     
     return epoch_loss
 
-def save_checkpoint(
-    models: Union[Module, Dict[str, Module]],
-    optimizers: Union[Optimizer, Dict[str, Optimizer]],
-    epoch: int,
-    loss: float,
-    save_dir: str,
-    prefix: str = "model",
-    dt: str = "",
-    checkpoint_path: Optional[str] = None,
-    create_subdir: bool = False
-) -> str:
-    """
-    Saves a checkpoint for one or multiple models and optimizers.
 
-    Args:
-        models (Module or Dict[str, Module]):
-            Either a single PyTorch model (nn.Module) or a dictionary mapping
-            a string key to multiple models (e.g., {'encoder': enc_model, 'decoder': dec_model}).
-        optimizers (Optimizer or Dict[str, Optimizer]):
-            Either a single PyTorch optimizer or a dictionary mapping
-            a string key to multiple optimizers.
-        epoch (int):
-            The current training epoch.
-        loss (float):
-            The training (or validation) loss at this epoch.
-        save_dir (str):
-            The directory where you want to save the checkpoint (used only if `checkpoint_path` is not specified).
-        prefix (str, optional):
-            A prefix for the filename (default: "model").
-        dt (str, optional):
-            A date/time string or unique identifier for the checkpoint file (default: "").
-        checkpoint_path (str, optional):
-            If provided, saves the checkpoint to this path (overwriting if it exists).
-            If None, a filename is constructed using `save_dir`, `prefix`, `dt`, and `epoch`.
-            Default: None
-        create_subdir (bool, optional):
-            If True, a new subdirectory named with the prefix or dt can be created
-            to organize checkpoints. Defaults to False.
-
-    Returns:
-        str: The final file path of the saved checkpoint.
-    """
-
-    # 1. If a direct path is provided, we save there. Otherwise, build the path.
-    if checkpoint_path is None:
-        if create_subdir and dt:
-            save_dir = os.path.join(save_dir, f"{prefix}_{dt}")
-
-        # Ensure directory exists
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Construct filename
-        file_name = f"{prefix}"
-        if dt:
-            file_name += f"_{dt}"
-        file_name += f"_epoch{epoch}.pth"
-        save_path = os.path.join(save_dir, file_name)
-    else:
-        # If checkpoint_path is specified, just use it directly
-        save_path = checkpoint_path.replace(".pth.jar", f"_FT_{epoch}.pth.jar")
-        # Ensure its parent directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    # 2. Create the checkpoint dictionary
-    checkpoint = {
-        "epoch": epoch,
-        "loss": loss,
-        "datetime": dt  # for reference if needed
-    }
-
-    # 3. Handle single vs multiple models
-    if isinstance(models, dict):
-        for model_name, model_obj in models.items():
-            # Check if the model is wrapped with DDP and access module.state_dict
-            if isinstance(model_obj, torch.nn.parallel.DistributedDataParallel):
-                checkpoint[f"{model_name}_state_dict"] = model_obj.module.state_dict()
-            else:
-                checkpoint[f"{model_name}_state_dict"] = model_obj.state_dict()
-    else:
-        # Check if the single model is wrapped with DDP and access module.state_dict
-        if isinstance(models, torch.nn.parallel.DistributedDataParallel):
-            checkpoint["model_state_dict"] = models.module.state_dict()
-        else:
-            checkpoint["model_state_dict"] = models.state_dict()
-
-    # 4. Handle single vs multiple optimizers
-    if isinstance(optimizers, dict):
-        for opt_name, opt_obj in optimizers.items():
-            checkpoint[f"{opt_name}_state_dict"] = opt_obj.state_dict()
-    else:
-        checkpoint["optimizer_state_dict"] = optimizers.state_dict()
-
-    # 5. Save the checkpoint only on rank 0
-    if torch.distributed.get_rank() == 0:
-        torch.save(checkpoint, save_path)
-        print(f"Checkpoint saved to: {save_path}")
-    
-    return save_path
 
 
 # def save_checkpoint(
