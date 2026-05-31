@@ -1,0 +1,18 @@
+name: floro-geo
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - einops
+  - rasterio
+  - pyproj
+  - wandb
+  - scikit-learn=1.4
+  - scikit-image=0.22
+  - numpy=1.26

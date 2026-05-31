@@ -94,6 +94,17 @@ The auxiliary stream represents terrain and radar information.
 
 ---
 
+## Installation
+
+Create the FLORO conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate floro-geo
+pip install -e .
+```
+---
+
 ## Downstream Evaluation
 
 FLORO is evaluated under a frozen-encoder transfer protocol. The pretrained encoder is kept fixed, while task-specific decoders are trained for downstream prediction.
