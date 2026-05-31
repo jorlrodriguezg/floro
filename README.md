@@ -28,7 +28,7 @@ FLORO is pretrained using masked autoencoding on heterogeneous Earth observation
 
 ## 🧠 **Architecture**
 
-> FLORO uses a Vision Transformer encoder pretrained through masked autoencoding. During pretraining, heterogeneous remote sensing observations are tokenized and partially masked. The encoder learns latent representations from the visible tokens, while lightweight reconstruction decoders predict the masked content for each modality.
+FLORO uses a Vision Transformer encoder pretrained through masked autoencoding. During pretraining, heterogeneous remote sensing observations are tokenized and partially masked. The encoder learns latent representations from the visible tokens, while lightweight reconstruction decoders predict the masked content for each modality.
 
 > After pretraining, the shallow reconstruction decoders are discarded. The pretrained encoder is then evaluated under frozen-encoder transfer, where task-specific benchmark decoders are trained for downstream tasks such as semantic segmentation, scene classification, and regression.
 
@@ -120,9 +120,9 @@ This evaluation setup tests whether the pretrained representation transfers acro
 
 ## PANGAEA Benchmark Reproducibility
 
-> The `pangaea-bench/` directory contains the files used to reproduce the FLORO evaluation under the PANGAEA benchmark protocol. This directory intentionally mirrors the folder structure of the official PANGAEA repository, so that users can copy the provided files into the corresponding locations of a local PANGAEA installation.
+The `pangaea-bench/` directory contains the files used to reproduce the FLORO evaluation under the PANGAEA benchmark protocol. This directory intentionally mirrors the folder structure of the official PANGAEA repository, so that users can copy the provided files into the corresponding locations of a local PANGAEA installation.
 
-This directory intentionally mirrors the folder structure used by the official `pangaea-bench` repository. Our goal is to make the integration reproducible while the FLORO encoder wrapper and configuration files are not yet included in the upstream PANGAEA repository.
+> This directory intentionally mirrors the folder structure used by the official `pangaea-bench` repository. Our goal is to make the integration reproducible while the FLORO encoder wrapper and configuration files are not yet included in the upstream PANGAEA repository.
 
 ## Repository Structure
 
