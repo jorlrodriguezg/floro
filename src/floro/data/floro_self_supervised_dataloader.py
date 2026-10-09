@@ -432,7 +432,7 @@ class ImageRSMultiFolderDataset(Dataset):
     Expects folder structure like:
       root_dir/uav_rgb_dsm/*.tif
       root_dir/uav_ms_dsm/*.tif
-      root_dir/france_dtm/*.tif
+      root_dir/skysat_dtm/*.tif
       root_dir/s2_dem_s1/*.tif
     """
     def __init__(self, root_dir, transform=None):
@@ -442,7 +442,7 @@ class ImageRSMultiFolderDataset(Dataset):
         self.source_rules = {
             "uav_rgb_dsm": dict(bgr=[1,2,3], re=None, nir=None, nir2=None, swir=None, elev=[4], sar=None),
             "uav_ms_dsm":  dict(bgr=[1,2,3], re=[4], nir=[5], nir2=None, swir=None, elev=[6], sar=None),
-            "france_dtm":  dict(bgr=[1,2,3], re=None, nir=[4], nir2=None, swir=None, elev=[5], sar=None),
+            "skysat_dtm":  dict(bgr=[1,2,3], re=None, nir=[4], nir2=None, swir=None, elev=[5], sar=None),
             "s2_dem_s1":   dict(bgr=[1,2,3], re=[4], nir=[5], nir2=[6], swir=[7,8], elev=[9], sar=[10,11]),
         }
 
@@ -568,12 +568,12 @@ class ImageRSMultiFolderDataset(Dataset):
         vS    = 1.0 if sar  is not None else 0.0
 
         img = pack_image(H, W, BGR=bgr, RE=re, NIR=nir, NIR2=nir2, SWIR=swir,
-                            vBGR=vBGR, vRE=vRE, vNIR=vNIR, vSWIR=vSWIR)
+                            vBGR=vBGR, vRE=vRE, vNIR=vNIR, vNIR2=vNIR2, vSWIR=vSWIR)
         mod = pack_modalities(H, W, elev=elev, sar=sar, vE=vE, vS=vS)
         #print(f"Image: {img.shape}")
         #print(f"Modality:{mod.shape}")
 
-        sample = {"image": img, "modalities": mod, "geo_transform": gt}
+        sample = {"image": img, "modalities": mod, "geo_transform": gt, "source": src_key}
 
         if self.transform:
             sample = self.transform(sample)
@@ -599,12 +599,18 @@ def LoadersPreparation(
     noise_max=0.2,
     type="training",
     seed=0,
+    band_drop_kwargs=None,
 ):
-    train_transform = transforms.Compose([
+    train_transforms = [
         Augmentation(rotation_type=rotate_type, blur_sigma=blur_sigma, noise_max=noise_max, type=type),
+    ]
+    if band_drop_kwargs is not None:
+        train_transforms.append(BandDropping(**band_drop_kwargs))
+    train_transforms.extend([
         NormalizeWithValidity(img_mean=img_mean, img_std=img_std, mod_mean=mod_mean, mod_std=mod_std),
         ToTensor(),
     ])
+    train_transform = transforms.Compose(train_transforms)
 
     test_transform = transforms.Compose([
         NormalizeWithValidity(img_mean=img_mean, img_std=img_std, mod_mean=mod_mean, mod_std=mod_std),

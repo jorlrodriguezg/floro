@@ -7,6 +7,7 @@ from glob import glob
 import numpy as np
 import requests
 import rasterio
+from pyproj import Transformer
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -132,7 +133,7 @@ class PotsdamIRDEM(RawGeoFMDataset):
             download_url=download_url,
             auto_download=auto_download,
         )
-
+        self.img_size = img_size
         self.root_path = pathlib.Path(root_path)
         self.split = split
 
@@ -161,6 +162,29 @@ class PotsdamIRDEM(RawGeoFMDataset):
     def __getitem__(self, index):
         with rasterio.open(self.optical_list[index]) as src:
             optical = torch.from_numpy(src.read()).float()  # [4, H, W]
+            orig_transform = src.transform
+            crs = src.crs
+
+            # Weak transform to EPSG:3857
+            transformer = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
+            origin_x, origin_y = orig_transform.c, orig_transform.f
+            pixel_width, pixel_height = orig_transform.a, orig_transform.e
+
+            origin_x_3857, origin_y_3857 = transformer.transform(origin_x, origin_y)
+            next_x_3857, next_y_3857 = transformer.transform(origin_x + pixel_width, origin_y + pixel_height)
+
+            pixel_width_m = next_x_3857 - origin_x_3857
+            pixel_height_m = next_y_3857 - origin_y_3857
+
+            gt = torch.tensor([
+                origin_x_3857,
+                pixel_width_m,
+                0,
+                origin_y_3857,
+                0,
+                -abs(pixel_height_m)
+            ], dtype=torch.float32)
+            #gt = torch.tensor(src.transform.to_gdal(), dtype=torch.float32)
 
         with rasterio.open(self.dem_list[index]) as src:
             dem = torch.from_numpy(src.read(1)).float()     # [H, W]
@@ -197,7 +221,9 @@ class PotsdamIRDEM(RawGeoFMDataset):
                 "dem": dem,
             },
             "target": target,
-            "metadata": {},
+            "metadata": {
+                "gt": gt,
+            },
         }
         
     @staticmethod
@@ -381,7 +407,7 @@ class PotsdamIRDEM(RawGeoFMDataset):
             label_map=label_all_map,
             out_dir=out_dir,
             save_folder="train",
-            tile_size=256,
+            tile_size=self.img_size,
             overlap=0,
         )
 
@@ -393,7 +419,7 @@ class PotsdamIRDEM(RawGeoFMDataset):
             label_map=label_all_map,
             out_dir=out_dir,
             save_folder="val",
-            tile_size=256,
+            tile_size=self.img_size,
             overlap=0,
         )
 
@@ -405,7 +431,7 @@ class PotsdamIRDEM(RawGeoFMDataset):
             label_map=label_all_map,
             out_dir=out_dir,
             save_folder="test",
-            tile_size=256,
+            tile_size=self.img_size,
             overlap=0,
         )
 
@@ -442,6 +468,8 @@ def tile_and_save_split(
         with rasterio.open(image_path) as src_img:
             image = src_img.read()  # [4, H, W]
             image = np.transpose(image, (1, 2, 0))  # [H, W, 4]
+            source_transform = src_img.transform
+            source_crs = src_img.crs
 
         dsm = np.array(Image.open(dsm_path))  # [H, W] expected for normalized jpg
         label = np.array(Image.open(label_path))  # [H, W, 3]
@@ -479,17 +507,45 @@ def tile_and_save_split(
             f"image={len(image_tiles)}, dsm={len(dsm_tiles)}, label={len(label_tiles)}"
         )
 
-        for image_tile, dsm_tile, label_tile in zip(image_tiles, dsm_tiles, label_tiles):
+        # for image_tile, dsm_tile, label_tile in zip(image_tiles, dsm_tiles, label_tiles):
+        #     save_multiband_tiff(
+        #         os.path.join(out_dir, save_folder, "optical", f"{i}.tif"),
+        #         image_tile,
+        #     )
+        #     save_singleband_tiff(
+        #         os.path.join(out_dir, save_folder, "dem", f"{i}.tif"),
+        #         dsm_tile,
+        #     )
+        #     Image.fromarray(label_tile).save(
+        #         os.path.join(out_dir, save_folder, "labels", f"{i}.tif")
+        #     )
+        for (
+            (image_tile, x, y), (dsm_tile, _, _), (label_tile, _, _),
+        ) in zip(image_tiles, dsm_tiles, label_tiles):
+            tile_transform = rasterio.windows.transform(
+                rasterio.windows.Window(x, y, tile_size, tile_size),
+                source_transform,
+            )
             save_multiband_tiff(
                 os.path.join(out_dir, save_folder, "optical", f"{i}.tif"),
                 image_tile,
+                tile_transform,
+                source_crs,
             )
             save_singleband_tiff(
                 os.path.join(out_dir, save_folder, "dem", f"{i}.tif"),
                 dsm_tile,
+                tile_transform,
+                source_crs
             )
-            Image.fromarray(label_tile).save(
-                os.path.join(out_dir, save_folder, "labels", f"{i}.tif")
+            # Image.fromarray(label_tile).save(
+            #     os.path.join(out_dir, save_folder, "labels", f"{i}.tif")
+            # )
+            save_multiband_tiff(
+                os.path.join(out_dir, save_folder, "labels", f"{i}.tif"),
+                label_tile,
+                tile_transform,
+                source_crs,
             )
             i += 1
 
@@ -500,13 +556,12 @@ def tile_image(image, tile_size: int = 256, overlap: int = 0):
 
     for y in range(0, image.shape[0] - tile_size + 1, stride):
         for x in range(0, image.shape[1] - tile_size + 1, stride):
-            tile = image[y:y + tile_size, x:x + tile_size]
-            tiles.append(tile)
+            tiles.append((image[y:y + tile_size, x:x + tile_size], x, y))
 
     return tiles
 
 
-def save_multiband_tiff(path: str, array: np.ndarray):
+def save_multiband_tiff(path: str, array: np.ndarray, transform=None, crs=None):
     """
     Save [H, W, C] array as multiband TIFF.
     """
@@ -524,11 +579,13 @@ def save_multiband_tiff(path: str, array: np.ndarray):
         width=w,
         count=c,
         dtype=array.dtype,
+        transform=transform,
+        crs=crs,
     ) as dst:
         dst.write(array)
 
 
-def save_singleband_tiff(path: str, array: np.ndarray):
+def save_singleband_tiff(path: str, array: np.ndarray, transform=None, crs=None):
     """
     Save [H, W] array as single-band TIFF.
     """
@@ -545,6 +602,8 @@ def save_singleband_tiff(path: str, array: np.ndarray):
         width=w,
         count=1,
         dtype=array.dtype,
+        transform=transform,
+        crs=crs,
     ) as dst:
         dst.write(array, 1)
 

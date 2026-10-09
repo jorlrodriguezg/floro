@@ -77,7 +77,8 @@ class EspeletiaCHM(RawGeoFMDataset):
     def _read_tif(self, path: Path) -> np.ndarray:
         with rasterio.open(path) as src:
             arr = src.read()  # (C, H, W)
-        return arr
+            geo_transform = src.transform
+        return arr, geo_transform.to_gdal()
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
@@ -93,14 +94,19 @@ class EspeletiaCHM(RawGeoFMDataset):
         if not chm_path.exists():
             raise FileNotFoundError(f"CHM patch not found: {chm_path}")
 
-        ms = self._read_tif(ms_path).astype(np.float32)
-        dsm = self._read_tif(dsm_path).astype(np.float32)
-        chm = self._read_tif(chm_path).astype(np.float32)
+        ms, gt = self._read_tif(ms_path)
+        dsm, _ = self._read_tif(dsm_path)
+        chm, _ = self._read_tif(chm_path)
+
+        ms = ms.astype(np.float32)
+        dsm = dsm.astype(np.float32)
+        chm = chm.astype(np.float32)
 
 
         ms = torch.from_numpy(ms).float()
         dsm = torch.from_numpy(dsm).float()
         chm = torch.from_numpy(chm).float()
+        gt = torch.tensor(gt, dtype=torch.float32)
 
         # Pangaea expects C T H W
         ms = ms.unsqueeze(1)   # [6, 1, H, W]
@@ -115,6 +121,7 @@ class EspeletiaCHM(RawGeoFMDataset):
             },
             "target": chm.clip(0.,50.),
             "metadata": {
+                "gt": gt,
                 "patch_id": sample.get("patch_id", str(index)),
                 "polygon_id": sample.get("polygon_id", -1),
                 "description": sample.get("description", ""),

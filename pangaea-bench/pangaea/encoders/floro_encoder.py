@@ -17,6 +17,13 @@ class InputScale(str, Enum):
     UNIT_01    = "unit_01"        # reflectance in [0,1] (range check 0..1)
     DATASET_RAW = "dataset_raw"   # raw dataset numbers -> map to FLORO using ds_stats + floro_stats
 
+
+class AvailabilityValidityMode(str, Enum):
+    ORIGINAL = "original"
+    ALL_ONES = "all_ones"
+    ALL_ZEROS = "all_zeros"
+
+
 class Format(str, Enum):
     NCHW = 'NCHW'
     NHWC = 'NHWC'
@@ -420,9 +427,22 @@ class FLOROGeoEncoder(nn.Module):
         device = multispectral.device
 
         # geotransform safety
-        if geotransform is not None:
-            assert geotransform.shape[0] >= B, "geotransform batch size must be >= multispectral batch size."
-            geotransform = geotransform[:B]
+        if self.pos_embed_type == "geo":
+            if geotransform is None:
+                raise ValueError(
+                    "FLORO pos_embed_type='geo' requires a geotransform for every image."
+                )
+            if geotransform.ndim != 2 or geotransform.shape[1] != 6:
+                raise ValueError(
+                    "geotransform must have shape (batch_size, 6) in GDAL order."
+                )
+            if geotransform.shape[0] < B:
+                raise ValueError(
+                    "geotransform batch size must be >= multispectral batch size."
+                )
+            geotransform = geotransform[:B].to(
+                device=device, dtype=multispectral.dtype
+            )
 
         # Decide whether modalities is actually present/used
         use_modalities = (modalities is not None) and (mask_ratio_mods < 1.0)
@@ -442,7 +462,7 @@ class FLOROGeoEncoder(nn.Module):
             patches_modalities = None
 
         # Positional embedding (shared)
-        if geotransform is not None and self.pos_embed_type == 'geo':
+        if self.pos_embed_type == "geo":
             normalized_centroids = self.get_normalized_centroids(geotransform, device)
             pos_embedding = self.positional_encoding(normalized_centroids)  # (B, N, D) or (B, ?, D) depending on your impl
         else:
@@ -560,6 +580,7 @@ class FLORO_Wrapper(Encoder):
         floro_stats: dict | None = None,
         z_clip: float = 5.0,
         dataset_cfg: Optional[dict] = None,
+        availability_validity_mode: str = "original",
     ):
         output_layers = (
             [output_layers] if isinstance(output_layers, int) else list(output_layers)
@@ -597,6 +618,9 @@ class FLORO_Wrapper(Encoder):
         self.floro_stats = floro_stats
         self.z_clip = float(z_clip)
         self.dataset_cfg = dataset_cfg
+        self.availability_validity_mode = AvailabilityValidityMode(
+            availability_validity_mode
+        )
 
         if self.input_scale == InputScale.DATASET_RAW:
             self.ds_stats = self._build_ds_stats_from_dataset_cfg()
@@ -645,6 +669,23 @@ class FLORO_Wrapper(Encoder):
             norm_layer=nn.LayerNorm,
             drop_max=drop_max,
         )
+
+    def _apply_availability_validity_mode(
+        self,
+        packed: torch.Tensor,
+        availability_validity_start: int,
+    ) -> torch.Tensor:
+        if self.availability_validity_mode == AvailabilityValidityMode.ORIGINAL:
+            return packed
+
+        value = (
+            1.0
+            if self.availability_validity_mode == AvailabilityValidityMode.ALL_ONES
+            else 0.0
+        )
+        packed = packed.clone()
+        packed[:, availability_validity_start:] = value
+        return packed
 
     def _get_optical_band(self, optical: torch.Tensor, floro_band: str) -> torch.Tensor | None:
         source_name = self.band_map.get(floro_band)
@@ -923,7 +964,9 @@ class FLORO_Wrapper(Encoder):
                 packed[:, 6:8] = SWIR[:, :2]
             packed[:, 12] = mSWIR
 
-        return packed
+        return self._apply_availability_validity_mode(
+            packed, availability_validity_start=8
+        )
 
     def _pack_modalities(self, image: dict[str, torch.Tensor]) -> torch.Tensor | None:
         dem = self._to_4d(image["dem"]) if (self.use_dem and "dem" in image) else None
@@ -973,7 +1016,9 @@ class FLORO_Wrapper(Encoder):
                 # If only one polarization is available -> Current behavior: ignore SAR entirely 
                 pass
 
-        return packed
+        return self._apply_availability_validity_mode(
+            packed, availability_validity_start=3
+        )
 
     @staticmethod
     def _to_4d(x: torch.Tensor) -> torch.Tensor:
@@ -1016,13 +1061,14 @@ class FLORO_Wrapper(Encoder):
     def forward(self, image: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         multispectral = self._pack_optical(image)
         modalities = self._pack_modalities(image)
+        geotransform = image.get("gt")
 
         modality_present = modalities is not None
 
         output = self.encoder(
             multispectral=multispectral,
             modalities=modalities,
-            geotransform=None,
+            geotransform=geotransform,
             mask_ratio_ms=self.mask_ratio_ms,
             mask_ratio_mods=self.mask_ratio_mods,
             return_intermediate=True,
@@ -1034,6 +1080,10 @@ class FLORO_Wrapper(Encoder):
         return [self._tokens_to_feature_map(tokens, modality_present) for tokens in features]
 
     def load_encoder_weights(self, logger: Logger) -> None:
+        logger.info(
+            "FLORO availability/validity mode: %s",
+            self.availability_validity_mode.value,
+        )
         if self.encoder_weights is None:
             return
 
